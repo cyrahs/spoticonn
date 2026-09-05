@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spoticonn
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: spoticonn
+  template:
+    metadata:
+      labels:
+        app: spoticonn
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        spoticonn/audio: "true"
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: spoticonn
+          image: spoticonn:0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: spoticonn-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 768Mi
+          startupProbe:
+            exec:
+              command: [spoticonn, healthcheck]
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: [spoticonn, healthcheck]
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command: [spoticonn, healthcheck]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: runtime
+              mountPath: /run/spoticonn
+            - name: temporary
+              mountPath: /tmp
+            - name: admin
+              mountPath: /run/secrets/spoticonn
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: spoticonn-data
+        - name: runtime
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: temporary
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: admin
+          secret:
+            secretName: spoticonn-admin
+            defaultMode: 0440

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spoticonn-config
+data:
+  SPOTICONN_LISTEN_ADDR: "127.0.0.1:8080"
+  SPOTICONN_INTERFACE: "eth0"
+  SPOTICONN_DATA_DIR: "/data"
+  SPOTICONN_RUNTIME_DIR: "/run/spoticonn"
+  SPOTICONN_ADMIN_PASSWORD_HASH_FILE: "/run/secrets/spoticonn/admin-password-hash"
+  SPOTICONN_SECURE_COOKIES: "false"

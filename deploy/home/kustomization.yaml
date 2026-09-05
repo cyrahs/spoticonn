@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: spoticonn
+resources:
+  - ../base
+patches:
+  - path: config.patch.yaml
+# If a registry is used, replace this with its real repository and immutable tag.
+images:
+  - name: spoticonn
+    newName: spoticonn
+    newTag: 0.1.0

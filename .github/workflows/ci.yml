@@ -1,0 +1,246 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  configuration:
+    name: Workflow and deployment configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x' # kubeconform's toolchain; application jobs use 1.25
+      - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+        with:
+          version: v1.35.0
+      - name: Install pinned validators
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
+      - name: Validate workflows, scripts and gate behavior
+        run: |
+          actionlint
+          shellcheck scripts/fetch-engines.sh scripts/ci/*.sh
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+          python3 scripts/ci/check-release-ref.py
+      - name: Validate rendered Kubernetes resources
+        run: |
+          kubectl kustomize deploy/base > /tmp/spoticonn-base.yaml
+          kubectl kustomize deploy/home > /tmp/spoticonn-home.yaml
+          kubeconform -strict -summary -kubernetes-version 1.35.0 /tmp/spoticonn-base.yaml /tmp/spoticonn-home.yaml
+
+  go-quality:
+    name: Go formatting and static analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.x'
+      - name: Check Go sources and module files
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [[ -n "$unformatted" ]]; then
+            printf 'Run gofmt on:\n%s\n' "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  go-tests:
+    name: Go tests / ${{ matrix.module }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: store
+            package: ./internal/store
+          - module: audio
+            package: ./internal/audio
+          - module: spotify
+            package: ./internal/spotify
+          - module: airplay
+            package: ./internal/airplay
+          - module: bridge
+            package: ./internal/bridge
+          - module: httpapi
+            package: ./internal/httpapi
+          - module: service
+            package: ./cmd/spoticonn
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.x'
+      - name: Run module tests with the race detector
+        env:
+          GO_PACKAGE: ${{ matrix.package }}
+        run: go test -race -count=1 -timeout=5m "$GO_PACKAGE"
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-dist
+          path: internal/webui/dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  binary:
+    name: Linux binary / ${{ matrix.arch }}
+    needs: frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.x'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: frontend-dist
+          path: internal/webui/dist/
+      - name: Build with the production frontend embedded
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o "bin/spoticonn-linux-$GOARCH" ./cmd/spoticonn
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-linux-${{ matrix.arch }}
+          path: bin/spoticonn-linux-*
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Container / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build and load the native image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          provenance: false # Docker archives do not retain build attestations
+          tags: spoticonn:ci-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=Spoticonn
+            org.opencontainers.image.description=Spotify Connect to AirPlay bridge
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+      - name: Smoke test engines and the non-root service
+        env:
+          IMAGE: spoticonn:ci-${{ matrix.arch }}
+        run: bash scripts/ci/smoke-image.sh "$IMAGE"
+      - name: Export the tested image for publication
+        if: github.event_name == 'push' && github.repository == 'cyrahs/spoticonn'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker save "spoticonn:ci-$ARCH" | gzip > "$RUNNER_TEMP/image-$ARCH.tar.gz"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push' && github.repository == 'cyrahs/spoticonn'
+        with:
+          name: image-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  ci-gate:
+    # Keep this name stable: it is the sole required check for PRs.
+    name: CI gate
+    if: ${{ always() }}
+    needs: [configuration, go-quality, go-tests, frontend, binary, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require every module to succeed
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/gate.py configuration go-quality go-tests frontend binary image
+
+  publish:
+    name: Publish to GHCR
+    needs: ci-gate
+    if: >-
+      github.event_name == 'push' && github.repository == 'cyrahs/spoticonn' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish.yml

@@ -1,0 +1,10 @@
+.git
+.claude
+bin
+data
+web/node_modules
+web/dist
+internal/webui/dist
+deploy/home/.env
+deploy/home/secret.env
+coverage.out

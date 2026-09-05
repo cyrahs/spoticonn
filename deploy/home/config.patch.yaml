@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spoticonn-config
+data:
+  # The home agent MUST replace this with the LAN address reachable through VPN.
+  # Kept on loopback until the actual host network has been inspected.
+  SPOTICONN_LISTEN_ADDR: "127.0.0.1:8080"
+  # Replace with the host NIC on the Apple TV's LAN; never a CNI/overlay NIC.
+  SPOTICONN_INTERFACE: "eth0"
