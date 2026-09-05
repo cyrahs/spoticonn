@@ -62,6 +62,15 @@ func New(m *bridge.Manager, passwordHash string, secure bool, files fs.FS) (http
 	})))
 	mux.Handle("DELETE /api/accounts/{id}", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, m.DeleteAccount(r.PathValue("id"))) })))
 	mux.Handle("POST /api/accounts/{id}/rebind", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, m.Rebind(r.PathValue("id"))) })))
+	mux.Handle("POST /api/accounts/{id}/oauth", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			CallbackURL string `json:"callback_url"`
+		}
+		if !decode(w, r, &b) {
+			return
+		}
+		respond(w, m.CompleteAuthorization(r.Context(), r.PathValue("id"), b.CallbackURL))
+	})))
 	mux.Handle("GET /api/airplay/devices", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { write(w, 200, m.Snapshot().Devices) })))
 	mux.Handle("POST /api/airplay/pairings", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var b struct {

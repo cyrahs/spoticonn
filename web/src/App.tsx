@@ -36,8 +36,10 @@ const accountStatus: Record<string, string> = {
   online: '已连接',
   starting: '正在启动',
   connecting: '正在连接',
-  waiting_spotify: '等待 Spotify 连接',
-  expired: '绑定超时',
+  waiting_oauth: '等待授权',
+  authorizing: '正在登录',
+  oauth_error: '需要重新登录',
+  expired: '授权超时',
   duplicate: '重复账号',
   error: '需要检查',
 }
@@ -142,6 +144,77 @@ function Modal({
   )
 }
 
+function SpotifyAuthorization({
+  account,
+  busy,
+  error,
+  submit,
+}: {
+  account: Account
+  busy: boolean
+  error: string
+  submit: (callback: string) => void
+}) {
+  const [callback, setCallback] = useState('')
+  return (
+    <div className="enrollment-hint">
+      <ShieldCheck size={20} />
+      <div className="oauth-enrollment">
+        <strong>登录「{account.label}」的 Spotify 账号</strong>
+        <p>
+          在新页面登录要添加的 Premium
+          账号并允许授权。完成后，浏览器会跳到一个无法访问的本机地址，这是正常的。
+        </p>
+        <a
+          className="primary compact oauth-link"
+          href={account.authorization!.url}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          登录 Spotify <ArrowRight size={16} />
+        </a>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault()
+            const value = callback.trim()
+            setCallback('')
+            submit(value)
+          }}
+        >
+          <label htmlFor="spotify-callback">授权后的完整回调地址</label>
+          <input
+            id="spotify-callback"
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            required
+            placeholder="http://127.0.0.1:36842/login?code=…&state=…"
+            aria-describedby="spotify-callback-help"
+            value={callback}
+            onChange={(event) => setCallback(event.target.value)}
+          />
+          <p id="spotify-callback-help">
+            复制授权后浏览器地址栏中的完整地址，回到这里粘贴。请保留 code 和 state；链接在{' '}
+            {new Date(account.authorization!.expires_at).toLocaleTimeString('zh-CN', {
+              hour: '2-digit',
+              minute: '2-digit',
+            })}{' '}
+            前有效。
+          </p>
+          <button className="primary compact" disabled={busy || !callback.trim()}>
+            完成登录
+          </button>
+          {error && (
+            <p className="error-text" role="alert">
+              {error}
+            </p>
+          )}
+        </form>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [state, setState] = useState<State | null>(null)
   const [authenticated, setAuthenticated] = useState(false)
@@ -233,7 +306,7 @@ export default function App() {
   const playing = state?.playback.status === 'playing'
   const recovering = state?.playback.recovering
   const canPause = playing || recovering || state?.playback.status === 'buffering'
-  const pending = state?.accounts.find((a) => !a.bound && a.status === 'waiting_spotify')
+  const pending = state?.accounts.find((a) => !a.bound && a.authorization)
   const pinWaiting = state?.pairing?.status === 'waiting_pin'
   const pairingActive =
     !!state?.pairing && ['starting', 'waiting_pin', 'verifying'].includes(state.pairing.status)
@@ -385,7 +458,7 @@ export default function App() {
               设备设置
             </button>
           </div>
-          {error && (
+          {error && !pending && (
             <div className="alert" role="alert">
               <span>{error}</span>
               <button className="icon-button" aria-label="关闭提示" onClick={() => setError('')}>
@@ -682,7 +755,7 @@ export default function App() {
                 </div>
                 <div>
                   <strong>先把你的 Spotify 带回家</strong>
-                  <p>添加一个 Premium 账号，在 Spotify App 中连接一次即可。</p>
+                  <p>添加一个 Premium 账号，通过 Spotify 网页授权即可登录。</p>
                 </div>
               </div>
             ) : (
@@ -700,7 +773,7 @@ export default function App() {
                           </span>
                         )}
                       </strong>
-                      <span>{a.username || '首次绑定后自动保存登录状态'}</span>
+                      <span>{a.username || '授权完成后自动保存登录状态'}</span>
                       {a.error && <small className="error-text">{a.error}</small>}
                     </div>
                     <Badge good={a.status === 'online'}>
@@ -708,8 +781,8 @@ export default function App() {
                     </Badge>
                     <button
                       className="icon-button"
-                      title="重新绑定"
-                      aria-label={`重新绑定 ${a.label}`}
+                      title="重新登录"
+                      aria-label={`重新登录 ${a.label}`}
                       disabled={busy}
                       onClick={() => void action(() => api(`/accounts/${a.id}/rebind`, 'POST'))}
                     >
@@ -729,18 +802,17 @@ export default function App() {
               </div>
             )}
             {pending && (
-              <div className="enrollment-hint">
-                <Radio size={20} />
-                <div>
-                  <strong>
-                    在 Spotify App 中选择「{state.settings.name} · 配对 {pending.id.slice(0, 4)}」
-                  </strong>
-                  <p>
-                    使用要添加的 Premium
-                    账号，在同一局域网中连接并播放一次。绑定完成后会自动变为常驻设备。
-                  </p>
-                </div>
-              </div>
+              <SpotifyAuthorization
+                key={pending.authorization!.url}
+                account={pending}
+                busy={busy}
+                error={error}
+                submit={(callback) =>
+                  void action(() =>
+                    api(`/accounts/${pending.id}/oauth`, 'POST', { callback_url: callback }),
+                  )
+                }
+              />
             )}
           </section>
           <section className="diagnostics">
@@ -778,7 +850,7 @@ export default function App() {
       {modal === 'account' && (
         <Modal title="添加 Spotify 账号" close={() => setModal(null)}>
           <p className="modal-intro">
-            为这个账号起一个备注，然后在同一局域网的 Spotify App 中完成首次连接。
+            为这个账号起一个备注，然后通过 Spotify 网页授权登录。手机无需连接家庭 Wi-Fi。
           </p>
           <form
             onSubmit={(e) => {
@@ -801,10 +873,10 @@ export default function App() {
             />
             <div className="modal-tip">
               <ShieldCheck size={17} />
-              无需在这里输入 Spotify 密码。绑定完成后，服务会保存此账号的设备凭据。
+              Spotify 密码只在 Spotify 授权页输入。登录完成后，服务会保存此账号的设备凭据。
             </div>
             <button className="primary full" disabled={busy}>
-              创建配对设备
+              开始登录
               <ArrowRight size={16} />
             </button>
           </form>
@@ -865,7 +937,10 @@ export default function App() {
             </li>
             <li>
               <strong>添加每个 Premium 账号</strong>
-              <p>在网页创建配对设备，然后用对应的 Spotify App 选择它并播放。每次添加一个账号。</p>
+              <p>
+                添加账号后打开 Spotify
+                授权页，再把授权后的完整回调地址粘贴回来。每次添加一个账号，无需同网配对。
+              </p>
             </li>
             <li>
               <strong>随时从 Spotify 开始播放</strong>
@@ -940,7 +1015,7 @@ export default function App() {
       {remove && (
         <Modal title="删除账号" close={() => setRemove(null)}>
           <p className="modal-intro">
-            从此设备删除「{remove.label}」的登录凭据？再次使用需要重新绑定。
+            从此设备删除「{remove.label}」的登录凭据？再次使用需要重新授权登录。
           </p>
           <button
             className="danger full"

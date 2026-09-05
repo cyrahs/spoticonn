@@ -1005,6 +1005,23 @@ nav {
   color: #89a487;
   margin-top: 6px;
 }
+.oauth-enrollment {
+  flex: 1;
+  min-width: 0;
+}
+.oauth-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 18px;
+  text-decoration: none;
+}
+.oauth-enrollment form button {
+  margin-top: 12px;
+}
+.oauth-enrollment .error-text {
+  color: #eeaaa1;
+}
 .diagnostics {
   margin-top: 22px;
   padding: 2px 3px;

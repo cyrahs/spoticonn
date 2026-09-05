@@ -41,6 +41,7 @@ type Config struct {
 	StartPlayer                                         func(context.Context, spotify.Config, func(spotify.Event), func(error)) (Player, error)
 	OpenOutput                                          func(context.Context, airplay.Config, model.Device, model.PairingSecret, int, int, func(string)) (Output, error)
 	DisableDiscovery                                    bool
+	ExchangeAuthorization                               func(context.Context, *spotify.Authorization, string) (*spotify.Login, error)
 }
 type runtimeAccount struct {
 	player            Player
@@ -50,6 +51,8 @@ type runtimeAccount struct {
 	failures          int
 	statusFailures    int
 	last              model.PlayerStatus
+	authorization     *spotify.Authorization
+	login             *spotify.Login
 }
 type event struct {
 	kind, id   string
@@ -85,6 +88,9 @@ type Manager struct {
 
 func New(parent context.Context, s *store.Store, cfg Config) *Manager {
 	ctx, cancel := context.WithCancel(parent)
+	if cfg.ExchangeAuthorization == nil {
+		cfg.ExchangeAuthorization = spotify.ExchangeAuthorization
+	}
 	if cfg.StartPlayer == nil {
 		cfg.StartPlayer = func(c context.Context, v spotify.Config, e func(spotify.Event), x func(error)) (Player, error) {
 			return spotify.Start(c, v, e, x)
@@ -189,6 +195,9 @@ func (m *Manager) Snapshot() model.Snapshot {
 		av := model.AccountView{Account: a, Status: "starting"}
 		if r := m.accounts[a.ID]; r != nil {
 			av.Status, av.Error = r.status, r.errorText
+			if r.authorization != nil && r.status == "waiting_oauth" && time.Now().Before(r.authorization.ExpiresAt) {
+				av.Authorization = &model.AuthorizationView{URL: r.authorization.URL, ExpiresAt: r.authorization.ExpiresAt}
+			}
 		}
 		v.Accounts = append(v.Accounts, av)
 	}
@@ -288,18 +297,26 @@ func (m *Manager) start(a model.Account) {
 		r = &runtimeAccount{}
 		m.accounts[a.ID] = r
 	}
+	if !a.Bound && r.login == nil {
+		if r.status != "oauth_error" && r.status != "authorizing" {
+			if r.authorization == nil {
+				r.authorization = spotify.NewAuthorization(a.AddedAt.Add(spotify.AuthorizationLifetime))
+			}
+			r.status, r.errorText = "waiting_oauth", ""
+		}
+		m.mu.Unlock()
+		return
+	}
 	r.generation++
 	generation := r.generation
 	r.status = "starting"
 	r.errorText = ""
 	r.statusFailures = 0
+	login := r.login
 	m.mu.Unlock()
 	state := m.store.Snapshot()
 	name := state.Settings.Name
-	if !a.Bound {
-		name += " · 配对 " + a.ID[:min(4, len(a.ID))]
-	}
-	cfg := spotify.Config{Binary: m.cfg.SpotifyBinary, Dir: m.store.AccountDir(a.ID), RuntimeDir: m.cfg.RuntimeDir, Name: name, Interface: m.cfg.Interface, Account: a, Volume: state.Settings.Volume}
+	cfg := spotify.Config{Binary: m.cfg.SpotifyBinary, Dir: m.store.AccountDir(a.ID), RuntimeDir: m.cfg.RuntimeDir, Name: name, Account: a, Login: login, Volume: state.Settings.Volume}
 	p, err := m.cfg.StartPlayer(m.ctx, cfg, func(ev spotify.Event) { m.emit(event{kind: "spotify", id: a.ID, generation: generation, spotify: ev}) }, func(error) { m.emit(event{kind: "exit", id: a.ID, generation: generation}) })
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -310,19 +327,27 @@ func (m *Manager) start(a model.Account) {
 		return
 	}
 	r.player = p
-	if a.Bound {
-		r.status = "connecting"
-	} else {
-		r.status = "waiting_spotify"
-	}
+	r.status = "connecting"
 }
 
 func (m *Manager) reconcile() {
 	for _, a := range m.store.Snapshot().Accounts {
 		m.mu.Lock()
 		r := m.accounts[a.ID]
+		if r == nil {
+			r = &runtimeAccount{}
+			m.accounts[a.ID] = r
+		}
 		m.mu.Unlock()
-		if !a.Bound && time.Since(a.AddedAt) > 10*time.Minute {
+		// Recover credentials saved just before a crash, even when the initial
+		// authorization window has elapsed since the service stopped.
+		if !a.Bound {
+			if username, err := spotify.Credentials(m.store.AccountDir(a.ID)); err == nil {
+				m.bind(a, username)
+				continue
+			}
+		}
+		if !a.Bound && time.Since(a.AddedAt) > spotify.AuthorizationLifetime {
 			if r != nil && r.player != nil {
 				m.stopAccount(a.ID)
 			}
@@ -330,8 +355,23 @@ func (m *Manager) reconcile() {
 			if m.accounts[a.ID] == nil {
 				m.accounts[a.ID] = &runtimeAccount{}
 			}
-			m.accounts[a.ID].status = "expired"
-			m.accounts[a.ID].errorText = "绑定已超时，请重新绑定"
+			r.authorization, r.login = nil, nil
+			if r.status != "duplicate" {
+				r.status = "expired"
+				r.errorText = "授权已超时，请重新登录"
+			}
+			m.mu.Unlock()
+			continue
+		}
+		if !a.Bound && r.login == nil {
+			m.start(a)
+			continue
+		}
+		if !a.Bound && !time.Now().Before(r.login.ExpiresAt) {
+			m.stopAccount(a.ID)
+			m.mu.Lock()
+			r.login, r.authorization = nil, nil
+			r.status, r.errorText = "oauth_error", "Spotify 登录信息已过期，请重新登录"
 			m.mu.Unlock()
 			continue
 		}
@@ -341,12 +381,6 @@ func (m *Manager) reconcile() {
 		}
 		if r.player == nil {
 			continue
-		}
-		if !a.Bound {
-			if username, err := spotify.Credentials(m.store.AccountDir(a.ID)); err == nil {
-				m.bind(a, username)
-				continue
-			}
 		}
 		ctx, cancel := context.WithTimeout(m.ctx, 1500*time.Millisecond)
 		status, err := r.player.Status(ctx)
@@ -430,6 +464,7 @@ func (m *Manager) bind(a model.Account, username string) {
 			})
 			m.mu.Lock()
 			r := m.accounts[a.ID]
+			r.login, r.authorization = nil, nil
 			r.status = "duplicate"
 			r.errorText = "此 Spotify 账号已绑定，请删除这条重复记录"
 			r.retryAt = time.Now().Add(365 * 24 * time.Hour)
@@ -438,6 +473,11 @@ func (m *Manager) bind(a model.Account, username string) {
 		}
 	}
 	m.stopAccount(a.ID)
+	m.mu.Lock()
+	if r := m.accounts[a.ID]; r != nil {
+		r.login, r.authorization = nil, nil
+	}
+	m.mu.Unlock()
 	err := m.store.Update(func(s *store.State) error {
 		for i := range s.Accounts {
 			if s.Accounts[i].ID == a.ID {
@@ -773,8 +813,8 @@ func (m *Manager) AddAccount(label string) (model.Account, error) {
 	}
 	state := m.store.Snapshot()
 	for _, a := range state.Accounts {
-		if !a.Bound && time.Since(a.AddedAt) < 10*time.Minute {
-			return model.Account{}, errors.New("请先完成或删除正在绑定的账号")
+		if !a.Bound && time.Since(a.AddedAt) < spotify.AuthorizationLifetime {
+			return model.Account{}, errors.New("请先完成或删除正在登录的账号")
 		}
 	}
 	a := model.Account{ID: store.ID(12), DeviceID: store.ID(20), Label: label, AddedAt: time.Now()}
@@ -827,8 +867,8 @@ func (m *Manager) Rebind(id string) error {
 		a := &state.Accounts[i]
 		if a.ID == id {
 			account = a
-		} else if !a.Bound && time.Since(a.AddedAt) < 10*time.Minute {
-			return errors.New("请先完成其他账号的绑定")
+		} else if !a.Bound && time.Since(a.AddedAt) < spotify.AuthorizationLifetime {
+			return errors.New("请先完成其他账号的登录")
 		}
 	}
 	if account == nil {
@@ -836,7 +876,7 @@ func (m *Manager) Rebind(id string) error {
 	}
 	m.stopAccount(id)
 	// Preserve the device identity, but remove both upstream credential formats.
-	for _, name := range []string{"credentials.json", "state.json"} {
+	for _, name := range []string{"credentials.json", "state.json", "config.yml"} {
 		if err := os.Remove(filepath.Join(m.store.AccountDir(id), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -854,6 +894,12 @@ func (m *Manager) Rebind(id string) error {
 	}); err != nil {
 		return err
 	}
+	m.mu.Lock()
+	if r := m.accounts[id]; r != nil {
+		r.login, r.authorization = nil, nil
+		r.status = ""
+	}
+	m.mu.Unlock()
 	m.start(*account)
 	m.changed()
 	return nil

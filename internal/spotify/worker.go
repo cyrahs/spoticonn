@@ -27,9 +27,10 @@ type Event struct {
 	Data json.RawMessage `json:"data"`
 }
 type Config struct {
-	Binary, Dir, RuntimeDir, Name, Interface string
-	Account                                  model.Account
-	Volume                                   int
+	Binary, Dir, RuntimeDir, Name string
+	Account                       model.Account
+	Login                         *Login
+	Volume                        int
 }
 type Worker struct {
 	Source *audio.Source
@@ -44,6 +45,14 @@ func (w *Worker) Route(rate int, forward func([]byte) error) { w.Source.Route(ra
 func (w *Worker) Drain()                                     { w.Source.Drain() }
 
 func Start(parent context.Context, cfg Config, emit func(Event), exited func(error)) (*Worker, error) {
+	// Never start an interactive listener as a fallback for missing credentials.
+	if cfg.Account.Bound {
+		if _, err := Credentials(cfg.Dir); err != nil {
+			return nil, fmt.Errorf("saved credentials unavailable: %w", err)
+		}
+	} else if cfg.Login == nil || cfg.Login.Username == "" || cfg.Login.AccessToken == "" || !time.Now().Before(cfg.Login.ExpiresAt) {
+		return nil, errors.New("Spotify OAuth login required")
+	}
 	if err := os.MkdirAll(cfg.Dir, 0700); err != nil {
 		return nil, err
 	}
@@ -65,32 +74,29 @@ func Start(parent context.Context, cfg Config, emit func(Event), exited func(err
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	_ = listener.Close()
-	credentialType := "interactive"
-	if !cfg.Account.Bound {
-		credentialType = "zeroconf"
-	}
 	config := map[string]any{
 		"device_id": cfg.Account.DeviceID, "device_name": cfg.Name, "device_type": "speaker",
 		"audio_backend": "pipe", "audio_output_pipe": fifo, "audio_output_pipe_format": "s16le",
 		"audio_output_pipe_wait_for_reader": true, "bitrate": 320, "flac_enabled": false,
 		"external_volume": true, "initial_volume": cfg.Volume, "volume_steps": 100, "ignore_last_volume": true,
-		"zeroconf_enabled": !cfg.Account.Bound, "log_level": "warn", "mpris_enabled": false,
-		"server":      map[string]any{"enabled": true, "address": "127.0.0.1", "port": port},
-		"credentials": map[string]any{"type": credentialType, "zeroconf": map[string]any{"persist_credentials": true}},
+		"zeroconf_enabled": false, "log_level": "warn", "mpris_enabled": false,
+		"prefer_firewall_friendly_ports": true,
+		"server":                         map[string]any{"enabled": true, "address": "127.0.0.1", "port": port},
+		"credentials":                    map[string]any{"type": "spotify_token"},
 	}
-	if cfg.Interface != "" {
-		config["zeroconf_interfaces_to_advertise"] = []string{cfg.Interface}
+	cleanConfig, _ := json.MarshalIndent(config, "", "  ")
+	if !cfg.Account.Bound {
+		config["credentials"] = map[string]any{"type": "spotify_token", "spotify_token": map[string]any{
+			"username": cfg.Login.Username, "access_token": cfg.Login.AccessToken,
+		}}
 	}
 	b, _ := json.MarshalIndent(config, "", "  ") // JSON is valid YAML; avoids string interpolation.
 	if err := store.AtomicWrite(filepath.Join(cfg.Dir, "config.yml"), b); err != nil {
 		return fail(err)
 	}
-	// Bound accounts must never unexpectedly start an interactive OAuth flow.
-	if cfg.Account.Bound {
-		if _, err := Credentials(cfg.Dir); err != nil {
-			return fail(fmt.Errorf("saved credentials unavailable: %w", err))
-		}
-	}
+	// The bootstrap token is written only to the private engine config, never
+	// argv or logs. Erase it once the process has finished reading/using it.
+	scrub := func() { _ = store.AtomicWrite(filepath.Join(cfg.Dir, "config.yml"), cleanConfig) }
 	ctx, cancel := context.WithCancel(parent)
 	cmd := exec.CommandContext(ctx, cfg.Binary, "--config_dir", cfg.Dir)
 	cmd.Env = append(os.Environ(), "XDG_CACHE_HOME="+filepath.Join(cfg.RuntimeDir, "cache"))
@@ -99,11 +105,13 @@ func Start(parent context.Context, cfg Config, emit func(Event), exited func(err
 	cmd.WaitDelay = 3 * time.Second
 	if err := cmd.Start(); err != nil {
 		cancel()
+		scrub()
 		return fail(err)
 	}
 	w := &Worker{Source: source, base: fmt.Sprintf("http://127.0.0.1:%d", port), client: &http.Client{Timeout: 4 * time.Second}, cancel: cancel, done: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
+		scrub()
 		cancel()
 		_ = source.Close()
 		close(w.done)
