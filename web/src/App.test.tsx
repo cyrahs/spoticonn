@@ -127,3 +127,74 @@ it('closes a dialog with Escape and returns focus to its trigger', async () => {
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(document.activeElement).toBe(trigger)
 })
+
+const livingRoom: State['devices'][number] = {
+  id: 'tv',
+  name: 'Living Room',
+  address: '192.0.2.10',
+  model: 'AppleTV14,1',
+  online: true,
+  paired: false,
+  group: true,
+  members: [
+    { id: 'tv', name: 'Living Room', model: 'AppleTV14,1', online: true },
+    { id: 'pod', name: 'Living Room (2)', model: 'AudioAccessory6,1', online: true },
+  ],
+}
+
+it('shows one Apple TV + HomePod output and selects and pairs its connection endpoint', async () => {
+  const state: State = structuredClone(empty)
+  state.devices = [structuredClone(livingRoom)]
+  const fetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+    if (url === '/api/settings' && opts?.method === 'PUT') {
+      state.settings = JSON.parse(opts.body as string)
+    }
+    return new Response(JSON.stringify(state))
+  })
+  vi.stubGlobal('fetch', fetch)
+  const user = userEvent.setup()
+  render(<App />)
+  const target = await screen.findByRole('button', { name: '选择 Living Room' })
+  expect(screen.getByText('Apple TV + HomePod')).toBeDefined()
+  expect(screen.getByText('通过 Apple TV 连接')).toBeDefined()
+  expect(screen.queryByRole('button', { name: '选择 Living Room (2)' })).toBeNull()
+  await user.click(target)
+  await waitFor(() => expect(target.getAttribute('aria-pressed')).toBe('true'))
+  expect(fetch).toHaveBeenCalledWith(
+    '/api/settings',
+    expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ ...empty.settings, target_id: 'tv' }),
+    }),
+  )
+  await user.click(screen.getByRole('button', { name: '输入配对码连接' }))
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/airplay/pairings',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ device_id: 'tv' }),
+      }),
+    ),
+  )
+})
+
+it('keeps the saved group selected and disables connection while its leader is unavailable', async () => {
+  const state: State = structuredClone(empty)
+  state.settings.target_id = 'tv'
+  state.devices = [{ ...structuredClone(livingRoom), online: false, waiting_for_leader: true }]
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockImplementation(async () => new Response(JSON.stringify(state))),
+  )
+  render(<App />)
+  const target = (await screen.findByRole('button', {
+    name: '选择 Living Room',
+  })) as HTMLButtonElement
+  expect(target.disabled).toBe(true)
+  expect(target.getAttribute('aria-pressed')).toBe('true')
+  expect(screen.getByText('等待主设备上线')).toBeDefined()
+  expect(
+    (screen.getByRole('button', { name: '输入配对码连接' }) as HTMLButtonElement).disabled,
+  ).toBe(true)
+})

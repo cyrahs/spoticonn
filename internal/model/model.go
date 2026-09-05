@@ -29,6 +29,22 @@ type Device struct {
 	Paired   bool              `json:"paired"`
 }
 
+// DeviceView describes one selectable output. Credentials and transport records
+// remain keyed by physical device ID, even when several devices share a group.
+type DeviceView struct {
+	Device
+	Group            bool           `json:"group,omitempty"`
+	WaitingForLeader bool           `json:"waiting_for_leader,omitempty"`
+	Members          []DeviceMember `json:"members,omitempty"`
+}
+
+type DeviceMember struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Model  string `json:"model"`
+	Online bool   `json:"online"`
+}
+
 type PairingSecret struct {
 	DACP        string `json:"dacp"`
 	Credentials string `json:"credentials"`
@@ -88,7 +104,7 @@ type Diagnostic struct {
 type Snapshot struct {
 	Settings         Settings      `json:"settings"`
 	Accounts         []AccountView `json:"accounts"`
-	Devices          []Device      `json:"devices"`
+	Devices          []DeviceView  `json:"devices"`
 	Pairing          *PairingView  `json:"pairing"`
 	Playback         Playback      `json:"playback"`
 	Diagnostics      []Diagnostic  `json:"diagnostics"`

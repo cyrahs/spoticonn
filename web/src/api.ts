@@ -41,6 +41,9 @@ export interface Device {
   model: string
   online: boolean
   paired: boolean
+  group?: boolean
+  waiting_for_leader?: boolean
+  members?: { id: string; name: string; model: string; online: boolean }[]
 }
 export interface Track {
   uri: string
