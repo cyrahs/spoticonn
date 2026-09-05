@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -176,7 +175,7 @@ func (m *Manager) Snapshot() model.Snapshot {
 	state := m.store.Snapshot()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	v := model.Snapshot{Settings: state.Settings, Accounts: []model.AccountView{}, Devices: []model.Device{}, Playback: m.playback, Diagnostics: append([]model.Diagnostic{}, m.diagnostics...), SpotifyAvailable: m.spotifyAvailable, AirPlayAvailable: m.airplayAvailable}
+	v := model.Snapshot{Settings: state.Settings, Accounts: []model.AccountView{}, Devices: []model.DeviceView{}, Playback: m.playback, Diagnostics: append([]model.Diagnostic{}, m.diagnostics...), SpotifyAvailable: m.spotifyAvailable, AirPlayAvailable: m.airplayAvailable}
 	if m.playback.Track != nil {
 		t := *m.playback.Track
 		v.Playback.Track = &t
@@ -192,13 +191,17 @@ func (m *Manager) Snapshot() model.Snapshot {
 		}
 		v.Accounts = append(v.Accounts, av)
 	}
-	for _, d := range m.devices {
-		d.Online = d.Online && time.Since(d.LastSeen) < 2*time.Minute
-		_, d.Paired = state.Pairings[d.ID]
-		d.TXT = nil
-		v.Devices = append(v.Devices, d)
+	for _, target := range airplay.Targets(m.devices, time.Now()) {
+		v.Devices = append(v.Devices, target.View(state.Pairings))
+		// Older installations may have selected a member before grouping was
+		// supported. Keep the corresponding group selected without moving keys.
+		if target.Matches(state.Settings.TargetID) {
+			v.Settings.TargetID = target.Device.ID
+		}
+		if v.Pairing != nil && target.Matches(v.Pairing.DeviceID) {
+			v.Pairing.DeviceID = target.Device.ID
+		}
 	}
-	sort.Slice(v.Devices, func(i, j int) bool { return v.Devices[i].Name < v.Devices[j].Name })
 	return v
 }
 
@@ -666,7 +669,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	}
 	state := m.store.Snapshot()
 	m.mu.Lock()
-	target, exists := m.devices[state.Settings.TargetID]
+	target, exists := airplay.ResolveTarget(m.devices, state.Settings.TargetID, time.Now())
 	m.mu.Unlock()
 	if !exists || state.Settings.TargetID == "" {
 		_ = r.player.Command(m.ctx, "pause", nil)
@@ -685,6 +688,10 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		_ = m.output.Metadata(status.Track)
 		m.setPlayback(func(v *model.Playback) { v.Status = "playing"; v.Error = ""; v.Track = status.Track })
 		return nil
+	}
+	if err := target.Ready(); err != nil {
+		_ = r.player.Command(m.ctx, "pause", nil)
+		return err
 	}
 	m.detach()
 	if previous != nil && previous.player != nil && old != id {
@@ -708,7 +715,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		v.Track = status.Track
 	})
 	generation := m.outputGeneration
-	output, err := m.cfg.OpenOutput(m.ctx, m.airplayConfig(), target, state.Pairings[target.ID], state.Settings.Volume, rate, func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) })
+	output, err := m.cfg.OpenOutput(m.ctx, m.airplayConfig(), target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) })
 	if err != nil {
 		return err
 	}
@@ -869,14 +876,32 @@ func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
 	if s.Volume < 0 || s.Volume > 100 {
 		return errors.New("音量范围为 0–100")
 	}
+	old := m.store.Snapshot().Settings
 	m.mu.Lock()
-	d, exists := m.devices[s.TargetID]
+	target, exists := airplay.ResolveTarget(m.devices, s.TargetID, time.Now())
+	previousTarget, previousExists := airplay.ResolveTarget(m.devices, old.TargetID, time.Now())
 	active := m.playback.AccountID
 	m.mu.Unlock()
 	if s.TargetID != "" && !exists {
 		return errors.New("输出设备不存在")
 	}
-	old := m.store.Snapshot().Settings
+	if exists {
+		s.TargetID = target.Device.ID
+	}
+	if previousExists {
+		old.TargetID = previousTarget.Device.ID
+	}
+	if old.TargetID != s.TargetID && exists {
+		if err := target.Ready(); err != nil {
+			return err
+		}
+	}
+	// A placeholder is only for presenting a group whose leader is unknown.
+	// Preserve an existing physical selection while changing name or volume.
+	if exists && target.Group && target.LeaderID == "" {
+		s.TargetID = m.store.Snapshot().Settings.TargetID
+		old.TargetID = s.TargetID
+	}
 	var resume *model.PlayerStatus
 	if old.TargetID != s.TargetID {
 		m.cancelOutputRecovery()
@@ -903,7 +928,9 @@ func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
 	if err := m.store.Update(func(st *store.State) error {
 		st.Settings = s
 		if exists {
-			st.Devices[d.ID] = d
+			for _, d := range target.Members {
+				st.Devices[d.ID] = d
+			}
 		}
 		return nil
 	}); err != nil {
@@ -982,12 +1009,17 @@ func (m *Manager) StartPairing(deviceID string) (model.PairingView, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
 	m.mu.Lock()
-	d, exists := m.devices[deviceID]
+	target, exists := airplay.ResolveTarget(m.devices, deviceID, time.Now())
 	busy := m.pairingView != nil && (m.pairingView.Status == "starting" || m.pairingView.Status == "waiting_pin" || m.pairingView.Status == "verifying")
 	m.mu.Unlock()
 	if !exists {
 		return model.PairingView{}, errors.New("设备不存在")
 	}
+	if err := target.Ready(); err != nil {
+		return model.PairingView{}, err
+	}
+	d := target.Device
+	deviceID = d.ID
 	if busy {
 		return model.PairingView{}, errors.New("已有配对正在进行")
 	}
@@ -1016,7 +1048,9 @@ func (m *Manager) StartPairing(deviceID string) (model.PairingView, error) {
 		if err == nil {
 			err = m.store.Update(func(s *store.State) error {
 				s.Pairings[deviceID] = model.PairingSecret{DACP: dacp, Credentials: credentials}
-				s.Devices[d.ID] = d
+				for _, member := range target.Members {
+					s.Devices[member.ID] = member
+				}
 				return nil
 			})
 		}

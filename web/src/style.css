@@ -809,6 +809,7 @@ nav {
   opacity: 0.5;
 }
 .device-symbol {
+  position: relative;
   width: 41px;
   height: 41px;
   border: 1px solid #3c4d40;
@@ -818,6 +819,22 @@ nav {
   flex-shrink: 0;
   color: #a2b89f;
   background: #2c3a2e;
+}
+.device-symbol-group > svg:first-child {
+  transform: translate(-3px, -2px);
+}
+.device-symbol .group-speaker {
+  position: absolute;
+  right: 2px;
+  bottom: 3px;
+  background: #2c3a2e;
+  border-radius: 3px;
+}
+.device-route {
+  margin: -2px 14px 5px 67px;
+  font-size: 9px;
+  line-height: 1.6;
+  color: #a2b89f;
 }
 .device-select > div:nth-child(2) {
   display: flex;

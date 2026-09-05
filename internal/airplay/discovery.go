@@ -41,8 +41,8 @@ func Discover(ctx context.Context, iface string, found func(model.Device)) error
 			}
 		}
 	}()
-	// The intended target is AirPlay 2. Query the combined _airplay service,
-	// avoiding duplicate _raop entries for the same Apple TV/HomePod route.
+	// Each physical device can advertise _airplay, including members of one
+	// Apple TV/HomePod group. Targets combines those records for selection.
 	return r.Browse(ctx, "_airplay._tcp", "local.", entries)
 }
 
@@ -62,6 +62,8 @@ func DeviceFromEntry(e *zeroconf.ServiceEntry) (model.Device, bool) {
 		sum := sha256.Sum256([]byte(e.Instance + "/" + e.HostName))
 		id = hex.EncodeToString(sum[:12])
 	}
+	// Preserve DNS presentation names in stored transport records, as older
+	// versions did. Decode exactly once when building the public target view.
 	d := model.Device{ID: id, Name: e.Instance, Address: e.AddrIPv4[0].String(), Port: e.Port, Model: txt["model"], TXT: txt, LastSeen: time.Now(), Online: e.TTL > 0}
 	return d, true
 }

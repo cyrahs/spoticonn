@@ -30,7 +30,7 @@ import {
   X,
 } from 'lucide-react'
 import { api, APIError } from './api'
-import type { Account, State } from './api'
+import type { Account, Device, State } from './api'
 
 const accountStatus: Record<string, string> = {
   online: '已连接',
@@ -50,6 +50,34 @@ const outputStatus: Record<string, string> = {
 }
 const clock = (n: number) =>
   `${Math.floor(n / 60000)}:${String(Math.floor(n / 1000) % 60).padStart(2, '0')}`
+
+const isAppleTV = (model: string) => model.toLowerCase().startsWith('appletv')
+const isHomePod = (model: string) => model.toLowerCase().startsWith('audioaccessory')
+const isHomeTheater = (d: Device) =>
+  d.group && d.members?.some((m) => isAppleTV(m.model)) && d.members.some((m) => isHomePod(m.model))
+function deviceType(d: Device) {
+  if (isHomeTheater(d)) return 'Apple TV + HomePod'
+  if (d.group) return 'AirPlay 音频组'
+  if (isAppleTV(d.model)) return 'Apple TV'
+  if (isHomePod(d.model)) return 'HomePod'
+  return 'AirPlay'
+}
+function deviceStatus(d: Device) {
+  if (d.waiting_for_leader) return '等待主设备上线'
+  if (!d.online) return '离线 · 等待重连'
+  return d.paired ? '已配对 · 在线' : '在线'
+}
+function DeviceSymbol({ device: d }: { device: Device }) {
+  return (
+    <div
+      className={`device-symbol ${isHomeTheater(d) ? 'device-symbol-group' : ''}`}
+      aria-hidden="true"
+    >
+      {isAppleTV(d.model) || isHomeTheater(d) ? <TvMinimal size={23} /> : <Speaker size={23} />}
+      {isHomeTheater(d) && <Speaker className="group-speaker" size={15} />}
+    </div>
+  )
+}
 
 function Brand() {
   return (
@@ -440,7 +468,7 @@ export default function App() {
                   <TvMinimal size={27} />
                 </div>
                 <strong>{target?.name || '选择 AirPlay 输出'}</strong>
-                <small>{target ? 'Apple TV / AirPlay' : '让家中的设备加入链路'}</small>
+                <small>{target ? deviceType(target) : '让家中的设备加入链路'}</small>
               </div>
               <div className="route-end">
                 <span>♪</span>
@@ -613,23 +641,27 @@ export default function App() {
                           )
                         }
                       >
-                        <div className="device-symbol">
-                          {d.model.toLowerCase().includes('appletv') ? (
-                            <TvMinimal size={23} />
-                          ) : (
-                            <Speaker size={23} />
-                          )}
-                        </div>
+                        <DeviceSymbol device={d} />
                         <div>
                           <strong>{d.name}</strong>
-                          <span>
-                            {d.online ? (d.paired ? '已配对 · 在线' : '在线') : '离线 · 等待重连'}
-                          </span>
+                          <span>{deviceType(d)}</span>
+                          <span>{deviceStatus(d)}</span>
                         </div>
                         <span className="radio-check">
                           {d.id === state.settings.target_id && <Check size={12} />}
                         </span>
                       </button>
+                      {d.group && (
+                        <p className="device-route">
+                          {d.waiting_for_leader
+                            ? '发现音频组成员，等待确认连接入口'
+                            : isAppleTV(d.model)
+                              ? '通过 Apple TV 连接'
+                              : isHomePod(d.model)
+                                ? '通过 HomePod 连接'
+                                : '通过组内主设备连接'}
+                        </p>
+                      )}
                       <button
                         className="pair-button"
                         disabled={busy || !d.online || pairingActive}
@@ -647,9 +679,9 @@ export default function App() {
               <div className="output-note">
                 <TvMinimal size={16} />
                 <p>
-                  HomePod 已设为 Apple TV 默认输出时，
+                  Apple TV 与 HomePod 属于同一音频组时会合并显示。
                   <br />
-                  请选择它们在 AirPlay 中显示的合体设备。
+                  选择合并后的目标，即可通过组内主设备连接。
                 </p>
               </div>
             </section>
@@ -856,7 +888,8 @@ export default function App() {
             <li>
               <strong>选择家中的 AirPlay 设备</strong>
               <p>
-                让 home 与 Apple TV 位于同一局域网。HomePod 是默认输出时，选择 Apple TV 的合体目标。
+                让 home 与 Apple TV 位于同一局域网，将 HomePod 设为 Apple TV
+                的默认音频输出。发现同组设备后会自动合并，选择标有「Apple TV + HomePod」的目标即可。
               </p>
             </li>
             <li>
