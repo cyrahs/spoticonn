@@ -75,8 +75,14 @@ type PlayerStatus struct {
 
 type AccountView struct {
 	Account
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Status        string             `json:"status"`
+	Error         string             `json:"error,omitempty"`
+	Authorization *AuthorizationView `json:"authorization,omitempty"`
+}
+
+type AuthorizationView struct {
+	URL       string    `json:"url"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 type PairingView struct {

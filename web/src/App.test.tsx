@@ -39,7 +39,7 @@ it('requires a management login before showing accounts', async () => {
   expect(await screen.findByLabelText('管理密码')).toBeDefined()
   expect(screen.queryByRole('button', { name: '添加账号' })).toBeNull()
 })
-it('creates a pairing endpoint with a label and shows the exact Spotify device name', async () => {
+it('creates an OAuth login and submits the pasted callback without navigating to it', async () => {
   const state: State = structuredClone(empty)
   const fetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
     if (url === '/api/accounts' && opts?.method === 'POST') {
@@ -50,9 +50,22 @@ it('creates a pairing endpoint with a label and shows the exact Spotify device n
         username: '',
         device_id: 'stable-id',
         bound: false,
-        status: 'waiting_spotify',
+        status: 'waiting_oauth',
+        authorization: {
+          url: 'https://accounts.spotify.com/authorize?state=test',
+          expires_at: new Date(Date.now() + 600000).toISOString(),
+        },
       })
       return new Response('{}', { status: 201 })
+    }
+    if (url === '/api/accounts/abcd1234/oauth') {
+      expect(opts?.method).toBe('POST')
+      expect(JSON.parse(opts!.body as string)).toEqual({
+        callback_url: 'http://127.0.0.1:36842/login?code=test&state=test',
+      })
+      state.accounts[0].status = 'connecting'
+      delete state.accounts[0].authorization
+      return new Response('{}')
     }
     return new Response(JSON.stringify(state))
   })
@@ -61,9 +74,87 @@ it('creates a pairing endpoint with a label and shows the exact Spotify device n
   render(<App />)
   await user.click(await screen.findByRole('button', { name: '添加账号' }))
   await user.type(screen.getByLabelText('账号备注'), '我的账号')
-  await user.click(screen.getByRole('button', { name: '创建配对设备' }))
-  expect(await screen.findByText('在 Spotify App 中选择「客厅 · 配对 abcd」')).toBeDefined()
+  await user.click(screen.getByRole('button', { name: '开始登录' }))
+  const link = await screen.findByRole('link', { name: '登录 Spotify' })
+  expect(link.getAttribute('href')).toBe('https://accounts.spotify.com/authorize?state=test')
+  expect(link.getAttribute('target')).toBe('_blank')
+  expect(link.getAttribute('rel')).toContain('noreferrer')
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  const callback = screen.getByLabelText('授权后的完整回调地址')
+  await user.type(callback, 'http://127.0.0.1:36842/login?code=test&state=test')
+  await user.click(screen.getByRole('button', { name: '完成登录' }))
+  await waitFor(() => expect(screen.queryByLabelText('授权后的完整回调地址')).toBeNull())
+  expect(screen.getByText('正在连接')).toBeDefined()
+})
+
+it('clears a submitted callback and shows an authorization error', async () => {
+  const state: State = structuredClone(empty)
+  state.accounts = [
+    {
+      id: 'a',
+      label: 'A',
+      username: '',
+      device_id: 'stable',
+      bound: false,
+      status: 'waiting_oauth',
+      authorization: {
+        url: 'https://accounts.spotify.com/authorize?state=current',
+        expires_at: new Date(Date.now() + 600000).toISOString(),
+      },
+    },
+  ]
+  vi.stubGlobal(
+    'fetch',
+    vi
+      .fn()
+      .mockImplementation(async (url: string) =>
+        url.endsWith('/oauth')
+          ? new Response(JSON.stringify({ error: '授权地址与本次登录不匹配' }), { status: 400 })
+          : new Response(JSON.stringify(state)),
+      ),
+  )
+  const user = userEvent.setup()
+  render(<App />)
+  const callback = (await screen.findByLabelText('授权后的完整回调地址')) as HTMLInputElement
+  await user.type(callback, 'http://127.0.0.1:36842/login?code=old&state=old')
+  await user.click(screen.getByRole('button', { name: '完成登录' }))
+  expect(await screen.findByText('授权地址与本次登录不匹配')).toBeDefined()
+  expect(callback.value).toBe('')
+})
+
+it('offers re-login after expiry and preserves the account identity', async () => {
+  const state: State = structuredClone(empty)
+  state.accounts = [
+    {
+      id: 'a',
+      label: 'A',
+      username: '',
+      device_id: 'stable',
+      bound: false,
+      status: 'expired',
+      error: '授权已超时，请重新登录',
+    },
+  ]
+  const fetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+    if (url === '/api/accounts/a/rebind') {
+      expect(opts?.method).toBe('POST')
+      state.accounts[0].status = 'waiting_oauth'
+      state.accounts[0].authorization = {
+        url: 'https://accounts.spotify.com/authorize?state=new',
+        expires_at: new Date(Date.now() + 600000).toISOString(),
+      }
+      delete state.accounts[0].error
+    }
+    return new Response(JSON.stringify(state))
+  })
+  vi.stubGlobal('fetch', fetch)
+  const user = userEvent.setup()
+  render(<App />)
+  await user.click(await screen.findByRole('button', { name: '重新登录 A' }))
+  expect(
+    (await screen.findByRole('link', { name: '登录 Spotify' })).getAttribute('href'),
+  ).toContain('state=new')
+  expect(state.accounts[0].device_id).toBe('stable')
 })
 it('displays an unavailable audio engine as a real setup problem', async () => {
   vi.stubGlobal(

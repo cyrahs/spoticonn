@@ -33,6 +33,7 @@ export interface Account {
   bound: boolean
   status: string
   error?: string
+  authorization?: { url: string; expires_at: string }
 }
 export interface Device {
   id: string

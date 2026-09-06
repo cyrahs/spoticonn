@@ -133,3 +133,41 @@ func TestLoginRateLimit(t *testing.T) {
 		t.Fatal("brute-force attempts not limited")
 	}
 }
+
+func TestOAuthCallbackRequiresAuthenticatedSameOriginPOST(t *testing.T) {
+	h := testHandler(t)
+	c := login(t, h)
+	w := request(h, "POST", "/api/accounts", `{"label":"My Spotify"}`, c, "")
+	if w.Code != 201 {
+		t.Fatal(w.Body)
+	}
+	var account model.Account
+	_ = json.Unmarshal(w.Body.Bytes(), &account)
+	path := "/api/accounts/" + account.ID + "/oauth"
+	body := `{"callback_url":"http://127.0.0.1:36842/login?code=SECRET-CODE&state=wrong"}`
+	if request(h, "POST", path, body, nil, "").Code != 401 {
+		t.Fatal("unauthenticated callback accepted")
+	}
+	if request(h, "POST", path, body, c, "https://attacker.example").Code != 403 {
+		t.Fatal("cross-origin callback accepted")
+	}
+	w = request(h, "POST", path, body, c, "")
+	if w.Code != 400 || strings.Contains(w.Body.String(), "SECRET-CODE") {
+		t.Fatal("mismatched state accepted or echoed")
+	}
+	if request(h, "POST", path, `{"callback_url":"anything","access_token":"SECRET"}`, c, "").Code != 400 {
+		t.Fatal("arbitrary token field accepted")
+	}
+	if request(h, "GET", path, "", c, "").Code == 200 {
+		t.Fatal("callback accepted without a POST")
+	}
+	w = request(h, "GET", "/api/state", "", c, "")
+	var state model.Snapshot
+	_ = json.Unmarshal(w.Body.Bytes(), &state)
+	if state.Accounts[0].Authorization == nil || state.Accounts[0].Status != "waiting_oauth" {
+		t.Fatal("OAuth URL missing from authenticated state")
+	}
+	if strings.Contains(w.Body.String(), "code_verifier") || strings.Contains(w.Body.String(), "access_token") || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("OAuth state exposed secrets or was cacheable")
+	}
+}

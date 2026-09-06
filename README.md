@@ -13,7 +13,7 @@
 ## 当前交付范围
 
 - 中文管理网页：管理登录、账号添加／删除／重绑、AirPlay 发现与配对、输出选择、音量、播放控制、实时状态和诊断。
-- 后端：凭据隔离、原子持久化、设备身份复用、临时 Zeroconf 绑定、账号进程保活、输出接管、PCM 节奏控制、异常重连。
+- 后端：凭据隔离、原子持久化、设备身份复用、OAuth PKCE 登录、账号进程保活、输出接管、PCM 节奏控制、异常重连。
 - 单镜像构建及 k3s Kustomize 配置，支持 Linux amd64／arm64。
 - 使用模拟音频引擎的单元和进程集成测试，不需要真实 Spotify 凭据。
 
@@ -24,8 +24,8 @@
 1. 通过内网或 VPN 打开管理网页，使用部署时设置的管理密码登录。
 2. 选择 AirPlay 输出。Apple TV 与 HomePod 广播相同的音频组 ID 时会合并为一个目标，并显示「Apple TV + HomePod」。连接和配对自动使用组内主设备；无需分别选择两台设备。请先在 Apple TV 上将 HomePod 设为默认音频输出。
 3. 如设备要求配对，点击配对，输入电视上显示的四位码。日常播放是否需要开电视，以实机验收为准。
-4. 添加 Spotify 账号备注。用该 Premium 账号在同一局域网的 Spotify App 中选择 `Spoticonn · 配对 xxxx`，播放一次。
-5. 后端保存凭据，将临时配对设备转为该账号的常驻会话；对其他账号重复操作。一次只绑定一个账号，临时绑定十分钟后超时。
+4. 添加 Spotify 账号备注，点击「登录 Spotify」，在新页面使用该 Premium 账号登录并允许授权。
+5. 授权后浏览器会跳到 `http://127.0.0.1:36842/login?code=…&state=…`，显示无法访问是正常的：复制地址栏中的**完整地址**，回到管理网页粘贴并点击「完成登录」。后端保存设备凭据后，该账号成为常驻会话。对其他账号重复操作；一次只登录一个账号，授权链接十分钟有效。
 6. 各账号在自己的 Spotify 中选择配置的同名设备。B 发起播放时，A 暂停，音频输出切到 B。
 
 更改输出会暂时暂停并重新连接；失败时保留新选择并显示原因。改播放器名称会重新连接账号并暂停播放。删除账号只删除此服务保存的凭据，不修改 Spotify 账户本身。
@@ -69,9 +69,19 @@ export SPOTICONN_ADMIN_PASSWORD='替换为至少12字节的管理密码'
 | `SPOTICONN_SPOTIFY_BINARY` | `go-librespot` | Spotify 引擎路径 |
 | `SPOTICONN_AIRPLAY_BINARY` | `cliairplay` | AirPlay 引擎路径 |
 
-仅本地浏览器使用管理会话；音频引擎 API 绑定 loopback，不直接暴露给网页。管理 Cookie 为 HttpOnly、SameSite=Strict，默认有效十二小时，状态接口不缓存。没有公网 Ingress 或 Spotify 网页 OAuth 回调依赖。
+仅本地浏览器使用管理会话；音频引擎 API 绑定 loopback，不直接暴露给网页。管理 Cookie 为 HttpOnly、SameSite=Strict，默认有效十二小时，状态接口不缓存。OAuth 使用管理 API 接收手动粘贴的回调地址，不启动回调监听，不需要公网 Ingress、HTTPS 回调站点或同网 Spotify 配对。
 
 凭据保存在数据卷中的私有目录／文件（0700／0600）。这不是应用层加密；拥有宿主机或卷读取权限的管理员可以读取它们。备份整个数据目录时应将备份按凭据文件对待。
+
+## Spotify OAuth 与网络要求
+
+- 采用与 go-librespot v0.9.0 相同的公共 OAuth 客户端，无需另建 Spotify 开发者应用或填写 client secret；请求 `streaming` 和 `user-read-private` 权限。
+- 每次授权使用独立的 PKCE S256 verifier 和随机 state。后端校验完整回调的协议、地址、路径、state 和有效期；只提取授权码，**不会访问用户粘贴的 URL**。管理 Cookie 和请求来源校验同样适用于提交接口。
+- 授权链接可重复打开，兑换尝试只能提交一次。取消授权或兑换失败后点击账号旁的「重新登录」。刷新管理网页可继续当前授权；服务重启后，未完成的授权链接失效，请使用页面中的新链接，超时则重新登录。
+- 首次 access token 仅用于建立设备会话，临时写入权限为 0600 的引擎配置；进程退出时清除，登录成功后以保存的设备凭据重新启动。PKCE verifier 只在内存中，token、授权码不进入管理状态、日志或进程参数。设备凭据失效时需要重新授权，不依赖周期性刷新网页登录 token。
+- 现有已绑定账号继续复用原凭据和 device ID，无需重新登录。等待授权时不启动 Spotify 引擎；登录后也始终关闭 Spotify Zeroconf，不再需要 Spotify 的局域网发现或配对入站端口。
+- Spotify 仍需访问互联网。引擎优先尝试出站 TCP 443、80，再回退到 4070；端口 443 上的 Spotify 接入点连接不等同于普通 HTTPS，严格的应用层代理仍可能阻断它。
+- AirPlay 仍需家庭网络接口、mDNS、PTP 和协商的媒体／回连端口；这次登录调整不取消 AirPlay 的网络要求，k3s 部署继续使用 hostNetwork。
 
 ## 播放与恢复规则
 
@@ -95,8 +105,9 @@ export SPOTICONN_ADMIN_PASSWORD='替换为至少12字节的管理密码'
 | `GET /api/state` | 完整界面状态，不包含凭据 |
 | `GET /api/events` | SSE，`state` 事件携带完整状态 |
 | `GET /api/accounts` | 账号列表与会话状态 |
-| `POST /api/accounts` | `{ "label": "我的账号" }`，创建临时配对设备 |
-| `POST /api/accounts/{id}/rebind` | 删除该账号旧凭据并重新绑定，保留 device ID |
+| `POST /api/accounts` | `{ "label": "我的账号" }`，创建待授权账号；`GET /api/state` 返回该账号的 `authorization.url` 和 `authorization.expires_at` |
+| `POST /api/accounts/{id}/oauth` | `{ "callback_url": "http://127.0.0.1:36842/login?code=…&state=…" }`，校验并完成 OAuth 登录 |
+| `POST /api/accounts/{id}/rebind` | 删除该账号旧凭据并生成新的 OAuth 授权链接，保留 device ID |
 | `DELETE /api/accounts/{id}` | 停止账号实例并删除凭据 |
 | `GET /api/airplay/devices` | 自动发现的 AirPlay 2 设备 |
 | `POST /api/airplay/pairings` | `{ "device_id": "…" }` |

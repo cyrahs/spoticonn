@@ -90,9 +90,43 @@ func TestWorkerUsesPrivatePersistentIdentityAndLocalAPI(t *testing.T) {
 	if c["zeroconf_enabled"] != false || c["device_id"] != strings.Repeat("a", 40) || c["external_volume"] != true {
 		t.Fatalf("incorrect persistent worker config: %s", b)
 	}
+	credentials := c["credentials"].(map[string]any)
+	if credentials["type"] != "spotify_token" || credentials["spotify_token"] != nil || c["prefer_firewall_friendly_ports"] != true {
+		t.Fatal("saved credentials must not start OAuth or require a bootstrap token")
+	}
 	server := c["server"].(map[string]any)
 	if server["address"] != "127.0.0.1" {
 		t.Fatal("worker API exposed")
+	}
+}
+
+func TestWorkerRequiresOAuthAndScrubsBootstrapToken(t *testing.T) {
+	for _, bound := range []bool{true, false} {
+		if _, err := Start(context.Background(), Config{Dir: t.TempDir(), Account: model.Account{Bound: bound}}, nil, nil); err == nil {
+			t.Fatal("worker started without valid credentials")
+		}
+	}
+	dir := t.TempDir()
+	cfg := Config{Binary: helperBinary(t), Dir: dir, RuntimeDir: t.TempDir(), Name: "Home", Account: model.Account{ID: "oauth", DeviceID: strings.Repeat("b", 40)}, Login: &Login{Username: "alice", AccessToken: "SECRET-BOOTSTRAP", ExpiresAt: time.Now().Add(time.Minute)}}
+	w, err := Start(context.Background(), cfg, func(Event) {}, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w.Close)
+	b, _ := os.ReadFile(filepath.Join(dir, "config.yml"))
+	var config map[string]any
+	_ = json.Unmarshal(b, &config)
+	if config["zeroconf_enabled"] != false || config["credentials"].(map[string]any)["type"] != "spotify_token" || !strings.Contains(string(b), "SECRET-BOOTSTRAP") {
+		t.Fatal("OAuth bootstrap config did not disable discovery")
+	}
+	info, _ := os.Stat(filepath.Join(dir, "config.yml"))
+	if info.Mode().Perm() != 0600 {
+		t.Fatal("bootstrap token has unsafe permissions")
+	}
+	w.Close()
+	b, _ = os.ReadFile(filepath.Join(dir, "config.yml"))
+	if strings.Contains(string(b), "SECRET-BOOTSTRAP") {
+		t.Fatal("bootstrap token retained after worker stopped")
 	}
 }
 
