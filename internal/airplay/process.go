@@ -25,14 +25,19 @@ type Sender struct {
 	id           string
 	input        *os.File
 	cmdFD        int
+	ctx          context.Context
 	cancel       context.CancelFunc
 	done         chan struct{}
 	ready        chan struct{}
 	readyOnce    sync.Once
-	mu           sync.Mutex
-	commandMu    sync.Mutex
+	mu           sync.Mutex // control state and command writes share one ordering
 	closed       bool
 	pendingStart bool
+	volume       int
+	startEpoch   uint64
+	startAcks    []uint64
+	lastStartAt  int64
+	volumeTimer  *time.Timer
 	flushed      chan struct{}
 	status       func(string)
 }
@@ -83,7 +88,7 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		return err
 	}
 	cmd.WaitDelay = 2 * time.Second
-	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), status: status}
+	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -119,17 +124,25 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		scans.Wait()
 		_ = cmd.Wait()
 		_ = w.Close()
-		s.commandMu.Lock()
+		s.mu.Lock()
+		s.closed = true
+		s.cancelStartLocked()
 		_ = unix.Close(fd)
-		s.commandMu.Unlock()
-		_ = os.Remove(cmdPath)
 		close(s.done)
+		s.mu.Unlock()
+		_ = os.Remove(cmdPath)
 		if child.Err() == nil {
 			s.status("disconnected")
 		}
 	}()
 	select {
 	case <-s.ready:
+		// cliairplay v0.5.3 skips --volume=0 during AP2 setup. Explicitly
+		// set every initial value through the pipe before accepting PCM/START.
+		if err := s.Volume(volume); err != nil {
+			s.Close()
+			return nil, err
+		}
 		return s, nil
 	case <-s.done:
 		cancel()
@@ -163,16 +176,20 @@ func (s *Sender) scan(r io.Reader) {
 			}
 		case strings.HasPrefix(line, "audio "):
 			s.mu.Lock()
-			start := s.pendingStart
-			s.pendingStart = false
-			s.mu.Unlock()
-			if start {
-				if err := s.command("START_UNIX_MS=0\nACTION=START\n"); err != nil {
-					s.status("error")
+			var err error
+			if s.pendingStart && !s.closed {
+				s.cancelStartLocked()
+				err = s.commandLocked("START_UNIX_MS=0\nACTION=START\n")
+				if err == nil {
+					s.startAcks = append(s.startAcks, s.startEpoch)
 				}
 			}
+			s.mu.Unlock()
+			if err != nil {
+				s.status("error")
+			}
 		case strings.HasPrefix(line, "started "):
-			s.status("playing")
+			s.started(line)
 		case strings.HasPrefix(line, "flushed"):
 			s.mu.Lock()
 			if s.flushed != nil {
@@ -181,18 +198,97 @@ func (s *Sender) scan(r io.Reader) {
 			}
 			s.mu.Unlock()
 		case strings.HasPrefix(line, "error"):
+			s.cancelStart()
 			s.status("error")
 		case strings.HasPrefix(line, "disconnected"), strings.HasPrefix(line, "stopped"):
+			s.cancelStart()
 			s.status("disconnected")
 		}
 	}
 }
 
+// Invalidating a start does not discard its expected ack: cliairplay can
+// acknowledge a superseded start before acknowledging the next one. Retain
+// their command order so an old ack cannot schedule work for the new epoch.
+func (s *Sender) cancelStartLocked() {
+	s.startEpoch++
+	s.pendingStart = false
+	if s.volumeTimer != nil {
+		s.volumeTimer.Stop()
+		s.volumeTimer = nil
+	}
+}
+
+func (s *Sender) cancelStart() {
+	s.mu.Lock()
+	s.cancelStartLocked()
+	s.mu.Unlock()
+}
+
+func (s *Sender) started(line string) {
+	var at int64
+	for _, field := range strings.Fields(line) {
+		if value, ok := strings.CutPrefix(field, "at_unix_ms="); ok {
+			if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+				at = parsed
+			}
+			break
+		}
+	}
+	s.mu.Lock()
+	if s.closed || len(s.startAcks) == 0 || (at > 0 && at == s.lastStartAt) {
+		s.mu.Unlock()
+		return
+	}
+	epoch := s.startAcks[0]
+	s.startAcks = s.startAcks[1:]
+	s.lastStartAt = at
+	if epoch != s.startEpoch {
+		s.mu.Unlock()
+		return
+	}
+	if at <= 0 {
+		s.cancelStartLocked()
+		s.mu.Unlock()
+		s.status("error")
+		return
+	}
+	// The ack confirms a scheduled instant, not necessarily audible playback
+	// yet. Apply once that instant arrives, without blocking the status reader.
+	s.volumeTimer = time.AfterFunc(time.Until(time.UnixMilli(at)), func() {
+		s.mu.Lock()
+		if s.closed || s.ctx.Err() != nil || epoch != s.startEpoch {
+			s.mu.Unlock()
+			return
+		}
+		s.volumeTimer = nil
+		// Read the latest value while holding the same lock as Volume and
+		// the pipe write, so a concurrent mute cannot be overwritten.
+		err := s.commandLocked(fmt.Sprintf("VOLUME=%d\n", s.volume))
+		s.mu.Unlock()
+		if err != nil {
+			s.status("error")
+		} else {
+			s.status("playing")
+		}
+	})
+	s.mu.Unlock()
+}
+
 func (s *Sender) command(value string) error {
-	s.commandMu.Lock()
-	defer s.commandMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commandLocked(value)
+}
+
+func (s *Sender) commandLocked(value string) error {
+	if s.closed {
+		return errors.New("AirPlay 已断开")
+	}
 	select {
 	case <-s.done:
+		return errors.New("AirPlay 已断开")
+	case <-s.ctx.Done():
 		return errors.New("AirPlay 已断开")
 	default:
 	}
@@ -216,7 +312,13 @@ func (s *Sender) command(value string) error {
 	return nil
 }
 
-func (s *Sender) Begin() { s.mu.Lock(); s.pendingStart = true; s.mu.Unlock() }
+func (s *Sender) Begin() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.pendingStart = true
+	}
+}
 func (s *Sender) Write(b []byte) error {
 	_ = s.input.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	for len(b) > 0 {
@@ -233,11 +335,12 @@ func (s *Sender) Write(b []byte) error {
 }
 func (s *Sender) Flush(ctx context.Context) error {
 	s.mu.Lock()
-	s.pendingStart = false
+	s.cancelStartLocked()
 	ch := make(chan struct{})
 	s.flushed = ch
+	err := s.commandLocked("ACTION=FLUSH\n")
 	s.mu.Unlock()
-	if err := s.command("ACTION=FLUSH\n"); err != nil {
+	if err != nil {
 		return err
 	}
 	select {
@@ -253,11 +356,16 @@ func (s *Sender) Flush(ctx context.Context) error {
 }
 func (s *Sender) Standby() error {
 	s.mu.Lock()
-	s.pendingStart = false
-	s.mu.Unlock()
-	return s.command("ACTION=STANDBY\n")
+	defer s.mu.Unlock()
+	s.cancelStartLocked()
+	return s.commandLocked("ACTION=STANDBY\n")
 }
-func (s *Sender) Volume(v int) error { return s.command(fmt.Sprintf("VOLUME=%d\n", v)) }
+func (s *Sender) Volume(v int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.volume = v
+	return s.commandLocked(fmt.Sprintf("VOLUME=%d\n", v))
+}
 func (s *Sender) Metadata(t *model.Track) error {
 	if t == nil {
 		return nil
@@ -272,7 +380,7 @@ func (s *Sender) Close() {
 		return
 	}
 	s.closed = true
-	s.pendingStart = false
+	s.cancelStartLocked()
 	s.mu.Unlock()
 	s.cancel()
 	_ = s.input.Close()
