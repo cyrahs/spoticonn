@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -70,6 +71,8 @@ func TestRealSubprocessPairingProtocol(t *testing.T) {
 }
 func TestSenderPCMStartFlushAndPersistentInput(t *testing.T) {
 	binary := fakeBinary(t)
+	commandLog := filepath.Join(t.TempDir(), "commands")
+	t.Setenv("SPOTICONN_TEST_AIRPLAY_COMMANDS", commandLog)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	events := make(chan string, 8)
@@ -86,6 +89,9 @@ func TestSenderPCMStartFlushAndPersistentInput(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		if i > 0 {
 			if err := s.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Standby(); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -107,6 +113,62 @@ func TestSenderPCMStartFlushAndPersistentInput(t *testing.T) {
 	}
 	if err := s.Volume(50); err != nil {
 		t.Fatal(err)
+	}
+	trace := waitForEngineCommands(t, commandLog, "VOLUME=50\n", 1)
+	if strings.Count(trace, "VOLUME=30\n") != 3 || strings.Count(trace, "STATUS started") != 2 {
+		t.Fatalf("initial, cold-start and resume volumes missing: %s", trace)
+	}
+}
+
+func waitForEngineCommands(t *testing.T, path, command string, count int) string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b, _ := os.ReadFile(path)
+		if strings.Count(string(b), command) >= count {
+			return string(b)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("engine did not consume %q %d times: %s", command, count, b)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSenderInitialAndPostStartVolumeAcrossReconnect(t *testing.T) {
+	for _, volume := range []int{0, 30} {
+		t.Run(strconv.Itoa(volume), func(t *testing.T) {
+			binary := fakeBinary(t)
+			commandLog := filepath.Join(t.TempDir(), "commands")
+			t.Setenv("SPOTICONN_TEST_AIRPLAY_COMMANDS", commandLog)
+			for attempt := 0; attempt < 2; attempt++ {
+				events := make(chan string, 8)
+				s, err := Open(t.Context(), Config{Binary: binary, RuntimeDir: t.TempDir()}, model.Device{Address: "127.0.0.1", Port: 7000}, model.PairingSecret{}, volume, 44100, func(v string) { events <- v })
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(s.Close)
+				s.Begin()
+				if err := s.Write(make([]byte, 1764)); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case event := <-events:
+					if event != "playing" {
+						t.Fatal(event)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("sender never started")
+				}
+				trace := waitForEngineCommands(t, commandLog, fmt.Sprintf("VOLUME=%d\n", volume), 2*(attempt+1))
+				lines := strings.Split(strings.TrimSpace(trace), "\n")
+				cycle := lines[attempt*5:]
+				if len(cycle) != 5 || cycle[0] != fmt.Sprintf("VOLUME=%d", volume) || cycle[1] != "START_UNIX_MS=0" || cycle[2] != "ACTION=START" || !strings.HasPrefix(cycle[3], "STATUS started ") || cycle[4] != cycle[0] {
+					t.Fatalf("incorrect initial/post-start volume order: %s", trace)
+				}
+				s.Close()
+			}
+		})
 	}
 }
 func TestDiscoveryIdentitySurvivesAddressChange(t *testing.T) {
@@ -148,6 +210,13 @@ func TestAirPlayEngineProcess(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
+	var commandLog *os.File
+	if path := os.Getenv("SPOTICONN_TEST_AIRPLAY_COMMANDS"); path != "" {
+		commandLog, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			os.Exit(3)
+		}
+	}
 	fmt.Fprintln(os.Stderr, "[STATUS] connected")
 	fmt.Fprintln(os.Stdout, "[STATUS] clock_ready mode=ntp state=ready")
 	var buffered atomic.Bool
@@ -165,9 +234,16 @@ func TestAirPlayEngineProcess(t *testing.T) {
 	}()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
+		if commandLog != nil {
+			fmt.Fprintln(commandLog, sc.Text())
+		}
 		switch sc.Text() {
 		case "ACTION=START":
-			fmt.Fprintln(os.Stderr, "[STATUS] started at_unix_ms=1")
+			at := time.Now().Add(25 * time.Millisecond).UnixMilli()
+			if commandLog != nil {
+				fmt.Fprintf(commandLog, "STATUS started at_unix_ms=%d\n", at)
+			}
+			fmt.Fprintf(os.Stderr, "[STATUS] started at_unix_ms=%d\n", at)
 		case "ACTION=FLUSH":
 			buffered.Store(false)
 			fmt.Fprintln(os.Stderr, "[STATUS] flushed")
