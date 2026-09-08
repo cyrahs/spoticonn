@@ -3,6 +3,7 @@ package airplay
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -239,8 +240,15 @@ func TestAirPlayEngineProcess(t *testing.T) {
 	}()
 	sc := bufio.NewScanner(f)
 	var requested int64
+	var artworkFile, item string
 	join := false
 	for sc.Scan() {
+		if value, ok := strings.CutPrefix(sc.Text(), "ARTWORKFILE="); ok {
+			artworkFile = value
+		}
+		if value, ok := strings.CutPrefix(sc.Text(), "ITEMID="); ok {
+			item = value
+		}
 		if value, ok := strings.CutPrefix(sc.Text(), "START_UNIX_MS="); ok {
 			requested, _ = strconv.ParseInt(value, 10, 64)
 		}
@@ -252,6 +260,15 @@ func TestAirPlayEngineProcess(t *testing.T) {
 			if event := os.Getenv("SPOTICONN_TEST_AIRPLAY_REMOTE"); event != "" {
 				fmt.Fprintln(os.Stdout, event)
 			}
+			if artworkFile != "" && commandLog != nil {
+				data, err := os.ReadFile(artworkFile)
+				if err != nil {
+					fmt.Fprintln(commandLog, "ARTWORK_LOAD_FAILED")
+				} else {
+					fmt.Fprintf(commandLog, "ARTWORK_LOADED item=%s sha256=%x\n", item, sha256.Sum256(data))
+				}
+			}
+			artworkFile = ""
 		case "START_JOIN=1":
 			join = true
 		case "ACTION=START":
