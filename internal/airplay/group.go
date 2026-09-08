@@ -130,6 +130,8 @@ func OpenHomeTheater(ctx context.Context, cfg Config, target Target, pairings ma
 }
 
 func (g *groupOutput) primaryStatus(s string) {
+	var failure *memberFailure
+	var epoch uint64
 	switch s {
 	case "timeline_changed", "error", "disconnected", "clock_stalled":
 		g.mu.Lock()
@@ -143,6 +145,7 @@ func (g *groupOutput) primaryStatus(s string) {
 				if c.startCancel != nil {
 					c.startCancel()
 				}
+				failure, epoch = c.blocked, c.epoch
 			}
 			select {
 			case c.changed <- struct{}{}:
@@ -150,6 +153,11 @@ func (g *groupOutput) primaryStatus(s string) {
 			}
 		}
 		g.mu.Unlock()
+	}
+	if failure != nil {
+		// Whole-output recovery can close this cycle as soon as status is
+		// forwarded. Persist the primary source before that cancellation.
+		g.diagnostic(fmt.Sprintf("组合事件：cycle=%d role=homepod phase=%s reason=%s", epoch, failure.phase, failure.reason))
 	}
 	if s != "timeline_changed" {
 		g.status(s)

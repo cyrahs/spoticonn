@@ -441,3 +441,29 @@ func TestTypedAuthenticationErrorOnlyRefinesAppleTVFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestPrimaryFailureIsLoggedBeforeWholeOutputCancellation(t *testing.T) {
+	for _, reason := range []string{"error", "disconnected", "clock_stalled"} {
+		t.Run(reason, func(t *testing.T) {
+			g, p, _ := testGroup(t)
+			logs := groupLogs(g)
+			g.status = func(state string) {
+				if state == reason {
+					g.cancel()
+				}
+			}
+			g.open = func(context.Context, Config, model.Device, model.PairingSecret, int, int, func(string)) (timedOutput, error) {
+				g.primaryStatus(reason)
+				return nil, fmt.Errorf("cancelled output")
+			}
+			close(p.ack)
+			g.Begin()
+			_ = g.Write(make([]byte, 3528))
+			waitLog(t, logs, "组合事件：", "role=homepod", "phase=connect", "reason="+reason)
+			g.mu.Lock()
+			done := g.cycle.done
+			g.mu.Unlock()
+			<-done
+		})
+	}
+}
