@@ -127,6 +127,7 @@ sudo k3s kubectl -n spoticonn logs deployment/spoticonn
 | 检查 | 通过条件 | 实机结果 |
 | --- | --- | --- |
 | 基础播放 | 播放、暂停、继续、下一首、上一首、seek、音量均正常 | 待执行 |
+| iOS 暂停回传（#8） | 按 [控制验收](ISSUE_8_VALIDATION.md) 使用用户确认的 Apple TV 控制中心入口，核对成员回传、Spotify 暂停和 HomePod 静音；原生恢复、切歌、音量分别记录 | 待执行 |
 | Apple TV 起播音量（#3） | 冷启动、暂停恢复、断线重连后无需手动调音量即可出声；初始音量 0 全程静音，起播期间调音量或静音保留最新值；Apple TV + HomePod 和独立 HomePod 均通过，并记录 tvOS 版本 | 待执行 |
 | 账号接管 | A → B → A，重复至少 20 次，前账号暂停，听不到两路混音和旧缓存串音 | 待执行 |
 | 页面关闭 | 关闭网页及手机控制 App，播放继续 | 待执行 |

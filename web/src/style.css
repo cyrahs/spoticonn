@@ -836,6 +836,18 @@ nav {
   line-height: 1.6;
   color: #a2b89f;
 }
+.remote-control-help {
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.remote-control-help summary {
+  cursor: pointer;
+}
+.remote-control-help p {
+  margin: 8px 0 0;
+}
 .group-playback-status {
   margin: 12px 0 0;
   font-size: 12px;

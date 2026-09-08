@@ -23,6 +23,9 @@ import (
 type Config struct {
 	Binary, RuntimeDir, InterfaceIP string
 	SharedPTP                       bool
+	RemoteControl                   func(RemoteCommand) // must not block the engine reader
+	Artwork                         *ArtworkCache
+	Diagnostic                      func(string)
 }
 type Sender struct {
 	id             string
@@ -51,6 +54,12 @@ type Sender struct {
 	volumeTimer    *time.Timer
 	flushed        chan struct{}
 	status         func(string)
+	remoteControl  func(RemoteCommand)
+	deviceID       string
+	diagnostic     func(string)
+	runtimeDir     string
+	artworkCache   *ArtworkCache
+	artwork        *senderArtwork
 }
 
 func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSecret, volume, rate int, status func(string)) (*Sender, error) {
@@ -109,6 +118,8 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	}
 	cmd.WaitDelay = 2 * time.Second
 	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status, failed: make(chan struct{}), sharedPTP: cfg.SharedPTP, startConfirmed: make(chan struct{})}
+	s.remoteControl, s.deviceID = cfg.RemoteControl, d.ID
+	s.diagnostic, s.runtimeDir, s.artworkCache = cfg.Diagnostic, cfg.RuntimeDir, cfg.Artwork
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -143,15 +154,18 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	go func() {
 		scans.Wait()
 		_ = cmd.Wait()
+		unexpected := child.Err() == nil
+		cancel() // invalidate queued controls even on an unexpected process exit
 		_ = w.Close()
 		s.mu.Lock()
 		s.closed = true
 		s.cancelStartLocked()
+		s.stopArtworkLocked()
 		_ = unix.Close(fd)
 		close(s.done)
 		s.mu.Unlock()
 		_ = os.Remove(cmdPath)
-		if child.Err() == nil {
+		if unexpected {
 			s.status("disconnected")
 		}
 	}()
@@ -193,6 +207,12 @@ func (s *Sender) scan(r io.Reader) {
 	scanner.Buffer(make([]byte, 4096), 256<<10)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if action := remoteAction(line); action != "" {
+			if s.remoteControl != nil && s.ctx.Err() == nil {
+				s.remoteControl(RemoteCommand{Context: s.ctx, DeviceID: s.deviceID, Action: action, ReceivedAt: time.Now()})
+			}
+			continue
+		}
 		i := strings.Index(line, "[STATUS] ")
 		if i < 0 {
 			continue
@@ -238,6 +258,13 @@ func (s *Sender) scan(r io.Reader) {
 				s.flushed = nil
 			}
 			s.mu.Unlock()
+		case strings.HasPrefix(line, "mrp artwork=rejected "):
+			// Fixed text only: engine output can contain paths or remote data.
+			s.artworkDiagnostic("引擎已省略或清除封面")
+		case strings.HasPrefix(line, "mrp artwork=posted "):
+			if !strings.Contains(line, " status=200 ") {
+				s.artworkDiagnostic("接收端未确认封面")
+			}
 		case strings.HasPrefix(line, "error"):
 			// Only trust the structured error code; engine detail may contain secrets.
 			fields := strings.Fields(line)
@@ -377,6 +404,7 @@ func (s *Sender) Begin() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.closed && !s.joinStart {
+		s.resumeArtworkLocked()
 		s.pendingStart = true
 	}
 }
@@ -455,6 +483,7 @@ func (s *Sender) Write(b []byte) error {
 }
 func (s *Sender) Flush(ctx context.Context) error {
 	s.mu.Lock()
+	s.suspendArtworkLocked()
 	s.cancelStartLocked()
 	s.resetStartLocked()
 	ch := make(chan struct{})
@@ -478,6 +507,7 @@ func (s *Sender) Flush(ctx context.Context) error {
 func (s *Sender) Standby() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.suspendArtworkLocked()
 	s.cancelStartLocked()
 	s.resetStartLocked()
 	return s.commandLocked("ACTION=STANDBY\n")
@@ -488,25 +518,27 @@ func (s *Sender) Volume(v int) error {
 	s.volume = v
 	return s.commandLocked(fmt.Sprintf("VOLUME=%d\n", v))
 }
-func (s *Sender) Metadata(t *model.Track) error {
-	if t == nil {
-		return nil
-	}
-	clean := func(v string) string { return strings.NewReplacer("\r", " ", "\n", " ", "\x00", "").Replace(v) }
-	return s.command(fmt.Sprintf("TITLE=%s\nARTIST=%s\nALBUM=%s\nITEMID=%s\nDURATION=%d\nPROGRESS=%d\nACTION=SENDMETA\n", clean(t.Name), clean(strings.Join(t.Artists, ", ")), clean(t.Album), clean(t.URI), t.Duration/1000, t.Position/1000))
-}
 func (s *Sender) Close() {
 	s.mu.Lock()
 	if s.closed {
+		a := s.artwork
 		s.mu.Unlock()
+		if a != nil {
+			<-a.done
+		}
 		return
 	}
 	s.closed = true
 	s.cancelStartLocked()
+	s.stopArtworkLocked()
+	a := s.artwork
 	s.mu.Unlock()
 	s.cancel()
 	_ = s.input.Close()
 	<-s.done
+	if a != nil {
+		<-a.done
+	}
 }
 
 type Pairing struct {
