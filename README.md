@@ -22,7 +22,7 @@
 ## 首次使用
 
 1. 通过内网或 VPN 打开管理网页，使用部署时设置的管理密码登录。
-2. 选择 AirPlay 输出。Apple TV 与 HomePod 广播相同的音频组 ID 时会合并为一个目标，并显示「Apple TV + HomePod」。连接和配对自动使用组内主设备；无需分别选择两台设备。请先在 Apple TV 上将 HomePod 设为默认音频输出。
+2. 选择 AirPlay 输出。Apple TV 与 HomePod 广播相同的音频组 ID 时会合并为一个目标，并显示「Apple TV + HomePod」。明确发现一台 HomePod 与一台 Apple TV 时，先启动 HomePod，等待发送器确认开始及持续音频，再让 Apple TV 按实际时间线加入。每个成员可独立配对，但播放时只选择一次组合。其他组继续通过主设备连接。请先在 Apple TV 上将 HomePod 设为默认音频输出。
 3. 如设备要求配对，点击配对，输入电视上显示的四位码。日常播放是否需要开电视，以实机验收为准。
 4. 添加 Spotify 账号备注，点击「登录 Spotify」，在新页面使用该 Premium 账号登录并允许授权。
 5. 授权后浏览器会跳到 `http://127.0.0.1:36842/login?code=…&state=…`，显示无法访问是正常的：复制地址栏中的**完整地址**，回到管理网页粘贴并点击「完成登录」。后端保存设备凭据后，该账号成为常驻会话。对其他账号重复操作；一次只登录一个账号，授权链接十分钟有效。
@@ -90,7 +90,9 @@ export SPOTICONN_ADMIN_PASSWORD='替换为至少12字节的管理密码'
 - 接管时断开旧音频路径，暂停旧账号。新账号先暂停，等待 AirPlay 连接和时钟就绪，再回到请求的播放位置继续。
 - 跨账号接管和换目标使用新的发送进程；同账号切歌／seek 清空发送缓存，防止旧内容串入新播放。
 - 重启旧进程后的迟到事件被 generation 标识丢弃；暂停／播放事件还需与实时状态核对，避免内部控制事件误夺输出。
-- 音量由 AirPlay 端应用一次；Spotify 引擎关闭 PCM 音量衰减。
+- 音量由 AirPlay 接收端应用；Spotify 引擎关闭 PCM 音量衰减。组合各成员使用当前设定值，加入过程中不会提高音量。
+- 两成员 Apple TV + HomePod 组合共享 PTP 时钟。Apple TV 加入失败时 HomePod 继续播放，网页显示原因；本次播放不自动重试该成员。暂停、切歌、seek、停止和切换输出会取消加入操作。较大组合（含两个 HomePod 的立体声组合）尚未验证分阶段启动，仍保留原有主设备路径。
+- Spotify iOS App 的 Connect 控制与 iOS 控制中心“控制其他扬声器与电视”是不同能力。当前桥接通过 Spotify Connect 控制播放，未实现 iOS 原生控制中心接管；实机出声与控制验收见 [组合验收记录](docs/ISSUE_5_VALIDATION.md)。
 - Spotify 子进程失败后退避重启；AirPlay 出错时先暂停 Spotify，再以退避方式重连并恢复当前请求。网页主动暂停会取消输出自动恢复。
 - 服务重启后恢复账号在线状态，不主动开始播放。设备离线不使管理服务健康检查失败。
 
@@ -110,7 +112,7 @@ export SPOTICONN_ADMIN_PASSWORD='替换为至少12字节的管理密码'
 | `POST /api/accounts/{id}/rebind` | 删除该账号旧凭据并生成新的 OAuth 授权链接，保留 device ID |
 | `DELETE /api/accounts/{id}` | 停止账号实例并删除凭据 |
 | `GET /api/airplay/devices` | 自动发现的 AirPlay 2 设备 |
-| `POST /api/airplay/pairings` | `{ "device_id": "…" }` |
+| `POST /api/airplay/pairings` | `{ "device_id": "…", "member_id": "…" }`（组合可指定物理成员；省略时配对初始音频入口） |
 | `POST /api/airplay/pairings/{id}/pin` | `{ "pin": "1234" }` |
 | `POST /api/airplay/pairings/{id}/cancel` | 取消进行中的配对 |
 | `GET /api/settings` | 读取全局配置 |

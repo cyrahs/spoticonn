@@ -75,11 +75,12 @@ func New(m *bridge.Manager, passwordHash string, secure bool, files fs.FS) (http
 	mux.Handle("POST /api/airplay/pairings", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var b struct {
 			DeviceID string `json:"device_id"`
+			MemberID string `json:"member_id"`
 		}
 		if !decode(w, r, &b) {
 			return
 		}
-		p, err := m.StartPairing(b.DeviceID)
+		p, err := m.StartMemberPairing(b.DeviceID, b.MemberID)
 		if err != nil {
 			fail(w, 400, err)
 			return

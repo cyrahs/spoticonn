@@ -20,26 +20,36 @@ import (
 	"spoticonn/internal/store"
 )
 
-type Config struct{ Binary, RuntimeDir, InterfaceIP string }
+type Config struct {
+	Binary, RuntimeDir, InterfaceIP string
+	SharedPTP                       bool
+}
 type Sender struct {
-	id           string
-	input        *os.File
-	cmdFD        int
-	ctx          context.Context
-	cancel       context.CancelFunc
-	done         chan struct{}
-	ready        chan struct{}
-	readyOnce    sync.Once
-	mu           sync.Mutex // control state and command writes share one ordering
-	closed       bool
-	pendingStart bool
-	volume       int
-	startEpoch   uint64
-	startAcks    []uint64
-	lastStartAt  int64
-	volumeTimer  *time.Timer
-	flushed      chan struct{}
-	status       func(string)
+	id             string
+	input          *os.File
+	cmdFD          int
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
+	ready          chan struct{}
+	readyOnce      sync.Once
+	failed         chan struct{}
+	failOnce       sync.Once
+	sharedPTP      bool
+	startSent      bool
+	joinStart      bool
+	anchor         int64
+	startConfirmed chan struct{}
+	mu             sync.Mutex // control state and command writes share one ordering
+	closed         bool
+	pendingStart   bool
+	volume         int
+	startEpoch     uint64
+	startAcks      []uint64
+	lastStartAt    int64
+	volumeTimer    *time.Timer
+	flushed        chan struct{}
+	status         func(string)
 }
 
 func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSecret, volume, rate int, status func(string)) (*Sender, error) {
@@ -69,6 +79,9 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	if cfg.InterfaceIP != "" {
 		args = append(args, "--if", cfg.InterfaceIP)
 	}
+	if cfg.SharedPTP {
+		args = append(args, "--ptp-shared", "--timing", "ptp")
+	}
 	if len(d.TXT) > 0 {
 		var txt []string
 		for k, v := range d.TXT {
@@ -88,7 +101,7 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		return err
 	}
 	cmd.WaitDelay = 2 * time.Second
-	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status}
+	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status, failed: make(chan struct{}), sharedPTP: cfg.SharedPTP, startConfirmed: make(chan struct{})}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -144,6 +157,9 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 			return nil, err
 		}
 		return s, nil
+	case <-s.failed:
+		s.Close()
+		return nil, errors.New("AirPlay 连接或共享时钟失败")
 	case <-s.done:
 		cancel()
 		return nil, errors.New("AirPlay 连接失败，请检查配对和网络")
@@ -168,10 +184,16 @@ func (s *Sender) scan(r io.Reader) {
 		line = line[i+9:]
 		switch {
 		case strings.HasPrefix(line, "clock_ready "):
+			if s.sharedPTP && strings.Contains(line, "mode=ntp") {
+				s.failOnce.Do(func() { close(s.failed) })
+				s.status("clock_stalled")
+				continue
+			}
 			if strings.Contains(line, "mode=ntp") || strings.Contains(line, "state=ready") {
 				s.readyOnce.Do(func() { close(s.ready) })
 			}
 			if strings.Contains(line, "state=stalled") {
+				s.failOnce.Do(func() { close(s.failed) })
 				s.status("clock_stalled")
 			}
 		case strings.HasPrefix(line, "audio "):
@@ -179,6 +201,7 @@ func (s *Sender) scan(r io.Reader) {
 			var err error
 			if s.pendingStart && !s.closed {
 				s.cancelStartLocked()
+				s.prepareStartLocked(false)
 				err = s.commandLocked("START_UNIX_MS=0\nACTION=START\n")
 				if err == nil {
 					s.startAcks = append(s.startAcks, s.startEpoch)
@@ -190,6 +213,8 @@ func (s *Sender) scan(r io.Reader) {
 			}
 		case strings.HasPrefix(line, "started "):
 			s.started(line)
+		case strings.HasPrefix(line, "REANCHOR "), strings.HasPrefix(line, "anchor_corrected "):
+			s.status("timeline_changed")
 		case strings.HasPrefix(line, "flushed"):
 			s.mu.Lock()
 			if s.flushed != nil {
@@ -198,6 +223,7 @@ func (s *Sender) scan(r io.Reader) {
 			}
 			s.mu.Unlock()
 		case strings.HasPrefix(line, "error"):
+			s.failOnce.Do(func() { close(s.failed) })
 			s.cancelStart()
 			s.status("error")
 		case strings.HasPrefix(line, "disconnected"), strings.HasPrefix(line, "stopped"):
@@ -252,6 +278,13 @@ func (s *Sender) started(line string) {
 		s.mu.Unlock()
 		s.status("error")
 		return
+	}
+	// Publish the acknowledged anchor immediately: late joiners must map PCM
+	// before the scheduled instant. The existing volume timer still controls
+	// the later playing notification and reapplies the latest volume.
+	s.anchor = at
+	if s.startConfirmed != nil {
+		close(s.startConfirmed)
 	}
 	// The ack confirms a scheduled instant, not necessarily audible playback
 	// yet. Apply once that instant arrives, without blocking the status reader.
@@ -315,10 +348,69 @@ func (s *Sender) commandLocked(value string) error {
 func (s *Sender) Begin() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.closed {
+	if !s.closed && !s.joinStart {
 		s.pendingStart = true
 	}
 }
+
+// prepareStartLocked preserves a waiting observer on the first start after a
+// flush, and replaces the acknowledged channel when a new audio cycle begins.
+func (s *Sender) prepareStartLocked(join bool) {
+	if s.startConfirmed == nil || s.anchor != 0 {
+		s.startConfirmed = make(chan struct{})
+	}
+	s.startSent, s.joinStart, s.anchor = true, join, 0
+}
+
+func (s *Sender) resetStartLocked() {
+	s.startSent, s.joinStart, s.anchor = false, false, 0
+	s.startConfirmed = make(chan struct{})
+}
+
+// Started returns the sender's acknowledged audible instant. Volume is applied
+// by the existing timer at that instant; the playing event follows its success.
+func (s *Sender) Started(ctx context.Context) (int64, error) {
+	s.mu.Lock()
+	ch := s.startConfirmed
+	s.mu.Unlock()
+	select {
+	case <-ch:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.anchor, nil
+	case <-s.done:
+		return 0, errors.New("AirPlay 已断开")
+	case <-s.failed:
+		return 0, errors.New("AirPlay 启动失败")
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// Join anchors before stdin is fed. Its acknowledgement uses the same epoch
+// ordering and post-start volume handling as an ordinary cold or warm start.
+func (s *Sender) Join(ctx context.Context, at int64) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	if s.closed || s.startSent || s.pendingStart {
+		s.mu.Unlock()
+		return 0, errors.New("AirPlay 成员已经启动")
+	}
+	s.cancelStartLocked()
+	s.prepareStartLocked(true)
+	err := s.commandLocked(fmt.Sprintf("START_UNIX_MS=%d\nSTART_JOIN=1\nACTION=START\n", at))
+	if err == nil {
+		s.startAcks = append(s.startAcks, s.startEpoch)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return s.Started(ctx)
+}
+
 func (s *Sender) Write(b []byte) error {
 	_ = s.input.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	for len(b) > 0 {
@@ -336,6 +428,7 @@ func (s *Sender) Write(b []byte) error {
 func (s *Sender) Flush(ctx context.Context) error {
 	s.mu.Lock()
 	s.cancelStartLocked()
+	s.resetStartLocked()
 	ch := make(chan struct{})
 	s.flushed = ch
 	err := s.commandLocked("ACTION=FLUSH\n")
@@ -358,6 +451,7 @@ func (s *Sender) Standby() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancelStartLocked()
+	s.resetStartLocked()
 	return s.commandLocked("ACTION=STANDBY\n")
 }
 func (s *Sender) Volume(v int) error {

@@ -26,19 +26,12 @@ type Player interface {
 	Drain()
 	Close()
 }
-type Output interface {
-	Begin()
-	Write([]byte) error
-	Flush(context.Context) error
-	Standby() error
-	Volume(int) error
-	Metadata(*model.Track) error
-	Close()
-}
+type Output = airplay.Output
 type Config struct {
 	SpotifyBinary, AirPlayBinary, RuntimeDir, Interface string
 	StartPlayer                                         func(context.Context, spotify.Config, func(spotify.Event), func(error)) (Player, error)
 	OpenOutput                                          func(context.Context, airplay.Config, model.Device, model.PairingSecret, int, int, func(string)) (Output, error)
+	OpenGroupOutput                                     func(context.Context, airplay.Config, airplay.Target, map[string]model.PairingSecret, int, int, func(string), func(string)) (Output, error)
 	DisableDiscovery                                    bool
 	ExchangeAuthorization                               func(context.Context, *spotify.Authorization, string) (*spotify.Login, error)
 }
@@ -70,6 +63,7 @@ type Manager struct {
 	accounts                           map[string]*runtimeAccount
 	devices                            map[string]model.Device
 	output                             Output
+	outputRate                         int
 	outputGeneration                   uint64
 	outputRetryAt                      time.Time
 	outputRetryAccount                 string
@@ -99,6 +93,9 @@ func New(parent context.Context, s *store.Store, cfg Config) *Manager {
 		cfg.OpenOutput = func(c context.Context, v airplay.Config, d model.Device, p model.PairingSecret, vol, rate int, cb func(string)) (Output, error) {
 			return airplay.Open(c, v, d, p, vol, rate, cb)
 		}
+	}
+	if cfg.OpenGroupOutput == nil {
+		cfg.OpenGroupOutput = airplay.OpenHomeTheater
 	}
 	_, se := exec.LookPath(cfg.SpotifyBinary)
 	_, ae := exec.LookPath(cfg.AirPlayBinary)
@@ -206,9 +203,6 @@ func (m *Manager) Snapshot() model.Snapshot {
 		// supported. Keep the corresponding group selected without moving keys.
 		if target.Matches(state.Settings.TargetID) {
 			v.Settings.TargetID = target.Device.ID
-		}
-		if v.Pairing != nil && target.Matches(v.Pairing.DeviceID) {
-			v.Pairing.DeviceID = target.Device.ID
 		}
 	}
 	return v
@@ -533,6 +527,13 @@ func (m *Manager) handle(e event) {
 		if e.generation != m.outputGeneration {
 			return
 		}
+		if strings.HasPrefix(e.status, "group_") {
+			m.setPlayback(func(p *model.Playback) {
+				p.GroupStatus = e.status
+				p.GroupReason = groupReason(e.status)
+			})
+			return
+		}
 		switch e.status {
 		case "playing":
 			m.setPlayback(func(p *model.Playback) {
@@ -611,6 +612,8 @@ func (m *Manager) handle(e event) {
 			}
 			if e.spotify.Type == "inactive" || e.spotify.Type == "stopped" {
 				m.cancelOutputRecovery()
+				m.closeOutput()
+				m.setPlayback(func(v *model.Playback) { v.OutputStatus = "disconnected" })
 			}
 			m.setPlayback(func(v *model.Playback) { v.Status = "paused" })
 		}
@@ -696,6 +699,7 @@ func (m *Manager) closeOutput() {
 		m.output.Close()
 		m.output = nil
 	}
+	m.setPlayback(func(v *model.Playback) { v.GroupStatus = ""; v.GroupReason = "" })
 }
 
 func (m *Manager) acquire(id string, status model.PlayerStatus) error {
@@ -722,7 +726,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	}
 	ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
 	defer cancel()
-	if old == id && m.output != nil {
+	if old == id && m.output != nil && m.outputRate == rate {
 		m.output.Begin()
 		r.player.Route(rate, m.output.Write)
 		_ = m.output.Metadata(status.Track)
@@ -755,11 +759,19 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		v.Track = status.Track
 	})
 	generation := m.outputGeneration
-	output, err := m.cfg.OpenOutput(m.ctx, m.airplayConfig(), target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) })
+	var output Output
+	var err error
+	cb := func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) }
+	if _, _, staged := target.HomeTheater(); staged {
+		output, err = m.cfg.OpenGroupOutput(m.ctx, m.airplayConfig(), target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
+	} else {
+		output, err = m.cfg.OpenOutput(m.ctx, m.airplayConfig(), target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
+	}
 	if err != nil {
 		return err
 	}
 	m.output = output
+	m.outputRate = rate
 	m.cancelOutputRecovery()
 	if err = r.player.Command(ctx, "volume", map[string]any{"volume": state.Settings.Volume}); err != nil {
 		m.closeOutput()
@@ -944,7 +956,7 @@ func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
 	}
 	// A placeholder is only for presenting a group whose leader is unknown.
 	// Preserve an existing physical selection while changing name or volume.
-	if exists && target.Group && target.LeaderID == "" {
+	if exists && strings.HasPrefix(target.Device.ID, "group:") {
 		s.TargetID = m.store.Snapshot().Settings.TargetID
 		old.TargetID = s.TargetID
 	}
@@ -1030,11 +1042,19 @@ func (m *Manager) setVolume(ctx context.Context, v int, spotifyToo bool) error {
 func (m *Manager) Playback(ctx context.Context, action string, value int64) error {
 	m.op.Lock()
 	defer m.op.Unlock()
-	if action == "pause" {
+	if action == "pause" || action == "stop" {
 		m.cancelOutputRecovery()
 	}
 	if action == "volume" {
 		return m.setVolume(ctx, int(value), true)
+	}
+	if action == "seek" && value < 0 {
+		return errors.New("播放位置不可为负数")
+	}
+	if action == "pause" || action == "stop" || action == "seek" || action == "next" || action == "prev" {
+		if group, ok := m.output.(interface{ CancelJoin() }); ok {
+			group.CancelJoin()
+		}
 	}
 	m.mu.Lock()
 	r := m.accounts[m.playback.AccountID]
@@ -1042,16 +1062,26 @@ func (m *Manager) Playback(ctx context.Context, action string, value int64) erro
 	if r == nil || r.player == nil {
 		return errors.New("请先在 Spotify 中选择此设备并播放")
 	}
-	if action == "seek" {
-		if value < 0 {
-			return errors.New("播放位置不可为负数")
+	if action == "stop" {
+		if err := r.player.Command(ctx, "pause", nil); err != nil {
+			return err
 		}
+		m.detach()
+		m.closeOutput()
+		m.setPlayback(func(v *model.Playback) { v.Status = "paused"; v.OutputStatus = "disconnected" })
+		return nil
+	}
+	if action == "seek" {
 		return r.player.Command(ctx, action, map[string]any{"position": value})
 	}
 	return r.player.Command(ctx, action, nil)
 }
 
 func (m *Manager) StartPairing(deviceID string) (model.PairingView, error) {
+	return m.StartMemberPairing(deviceID, "")
+}
+
+func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingView, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
 	m.mu.Lock()
@@ -1061,10 +1091,32 @@ func (m *Manager) StartPairing(deviceID string) (model.PairingView, error) {
 	if !exists {
 		return model.PairingView{}, errors.New("设备不存在")
 	}
-	if err := target.Ready(); err != nil {
-		return model.PairingView{}, err
-	}
 	d := target.Device
+	if pod, _, staged := target.HomeTheater(); staged {
+		d = pod
+		if memberID != "" {
+			found := false
+			for _, member := range target.Members {
+				if member.ID == memberID {
+					d = member
+					found = true
+				}
+			}
+			if !found {
+				return model.PairingView{}, errors.New("配对成员不属于所选组合")
+			}
+		}
+		if !d.Online {
+			return model.PairingView{}, errors.New("配对成员尚未上线")
+		}
+	} else {
+		if memberID != "" && memberID != d.ID {
+			return model.PairingView{}, errors.New("此目标不支持独立成员配对")
+		}
+		if err := target.Ready(); err != nil {
+			return model.PairingView{}, err
+		}
+	}
 	deviceID = d.ID
 	if busy {
 		return model.PairingView{}, errors.New("已有配对正在进行")

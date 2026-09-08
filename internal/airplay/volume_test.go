@@ -20,7 +20,7 @@ func controlSender(t *testing.T, volume int) (*Sender, func() string, chan strin
 	}
 	done := make(chan struct{})
 	events := make(chan string, 16)
-	s := &Sender{input: f, cmdFD: int(f.Fd()), ctx: t.Context(), done: done, volume: volume,
+	s := &Sender{input: f, cmdFD: int(f.Fd()), ctx: t.Context(), done: done, volume: volume, failed: make(chan struct{}), startConfirmed: make(chan struct{}),
 		cancel: func() { close(done) }, status: func(v string) { events <- v }}
 	t.Cleanup(s.Close)
 	return s, func() string {
@@ -241,4 +241,62 @@ func TestStartedVolumeFailureDoesNotReportPlaying(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestJoinAcknowledgesBeforeAudibleTimeAndKeepsLatestVolume(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, commands, events := controlSender(t, 30)
+		at := time.Now().Add(time.Second)
+		result := make(chan int64, 1)
+		go func() {
+			got, err := s.Join(t.Context(), at.UnixMilli())
+			if err != nil {
+				t.Error(err)
+			}
+			result <- got
+		}()
+		synctest.Wait()
+		senderStatus(s, startAck(at))
+		synctest.Wait()
+		if got := <-result; got != at.UnixMilli() {
+			t.Fatal("join did not return the acknowledged anchor")
+		}
+		if len(events) != 0 || strings.Contains(commands(), "VOLUME") {
+			t.Fatal("join applied volume before the audible instant")
+		}
+		if err := s.Volume(0); err != nil {
+			t.Fatal(err)
+		}
+		s.Begin()
+		senderStatus(s, "audio buffered_ms=10")
+		time.Sleep(time.Second)
+		synctest.Wait()
+		want := fmt.Sprintf("START_UNIX_MS=%d\nSTART_JOIN=1\nACTION=START\nVOLUME=0\nVOLUME=0\n", at.UnixMilli())
+		if commands() != want {
+			t.Fatalf("join duplicated START or overwrote mute: %q", commands())
+		}
+		expectSenderEvent(t, events, "playing")
+	})
+}
+
+func TestSupersededAckCannotCompleteGroupStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _, _ := controlSender(t, 30)
+		startSender(s)
+		old := time.Now().Add(time.Second)
+		flushSender(t, s)
+		startSender(s)
+		senderStatus(s, startAck(old))
+		select {
+		case <-s.startConfirmed:
+			t.Fatal("superseded ack completed the new group cycle")
+		default:
+		}
+		current := time.Now().Add(2 * time.Second)
+		senderStatus(s, startAck(current))
+		got, err := s.Started(t.Context())
+		if err != nil || got != current.UnixMilli() {
+			t.Fatal("group used the wrong epoch's anchor", got, err)
+		}
+	})
 }

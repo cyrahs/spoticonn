@@ -43,8 +43,11 @@ export interface Device {
   online: boolean
   paired: boolean
   group?: boolean
+  staged?: boolean
+  audio_device_id?: string
+  join_device_id?: string
   waiting_for_leader?: boolean
-  members?: { id: string; name: string; model: string; online: boolean }[]
+  members?: { id: string; name: string; model: string; online: boolean; paired?: boolean }[]
 }
 export interface Track {
   uri: string
@@ -64,6 +67,8 @@ export interface State {
     account_id: string
     status: string
     output_status: string
+    group_status?: string
+    group_reason?: string
     recovering?: boolean
     error?: string
     track: Track | null

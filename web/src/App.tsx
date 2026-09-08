@@ -50,6 +50,12 @@ const outputStatus: Record<string, string> = {
   playing: '正在播放',
   error: '连接异常',
 }
+const groupStatus: Record<string, string> = {
+  group_starting: '正在启动 HomePod',
+  group_joining: 'HomePod 已启动，正在加入 Apple TV',
+  group_joined: 'HomePod + Apple TV 已加入播放',
+  group_waiting: '等待继续播放',
+}
 const clock = (n: number) =>
   `${Math.floor(n / 60000)}:${String(Math.floor(n / 1000) % 60).padStart(2, '0')}`
 
@@ -665,6 +671,11 @@ export default function App() {
                 />
                 <span>{volume}%</span>
               </div>
+              {state.playback.group_status && (
+                <p role="status" className="group-playback-status">
+                  {state.playback.group_reason || groupStatus[state.playback.group_status]}
+                </p>
+              )}
               {recovering && <p className="inline-error">正在自动恢复连接，点击暂停可取消。</p>}
               {state.playback.error && (
                 <p role="status" className="inline-error">
@@ -726,25 +737,49 @@ export default function App() {
                       </button>
                       {d.group && (
                         <p className="device-route">
-                          {d.waiting_for_leader
-                            ? '发现音频组成员，等待确认连接入口'
-                            : isAppleTV(d.model)
-                              ? '通过 Apple TV 连接'
-                              : isHomePod(d.model)
-                                ? '通过 HomePod 连接'
-                                : '通过组内主设备连接'}
+                          {d.staged
+                            ? '先启动 HomePod，再加入 Apple TV'
+                            : d.waiting_for_leader
+                              ? '发现音频组成员，等待确认连接入口'
+                              : isAppleTV(d.model)
+                                ? '通过 Apple TV 连接'
+                                : isHomePod(d.model)
+                                  ? '通过 HomePod 连接'
+                                  : '通过组内主设备连接'}
                         </p>
                       )}
-                      <button
-                        className="pair-button"
-                        disabled={busy || !d.online || pairingActive}
-                        onClick={() =>
-                          void action(() => api('/airplay/pairings', 'POST', { device_id: d.id }))
-                        }
-                      >
-                        {d.paired ? '重新配对' : '输入配对码连接'}
-                        <ChevronRight size={13} />
-                      </button>
+                      {d.staged ? (
+                        d.members?.map((member) => (
+                          <button
+                            className="pair-button"
+                            key={member.id}
+                            disabled={busy || !member.online || pairingActive}
+                            onClick={() =>
+                              void action(() =>
+                                api('/airplay/pairings', 'POST', {
+                                  device_id: d.id,
+                                  member_id: member.id,
+                                }),
+                              )
+                            }
+                          >
+                            {member.paired ? '重新配对' : '配对'}{' '}
+                            {isHomePod(member.model) ? 'HomePod' : 'Apple TV'}
+                            <ChevronRight size={13} />
+                          </button>
+                        ))
+                      ) : (
+                        <button
+                          className="pair-button"
+                          disabled={busy || !d.online || pairingActive}
+                          onClick={() =>
+                            void action(() => api('/airplay/pairings', 'POST', { device_id: d.id }))
+                          }
+                        >
+                          {d.paired ? '重新配对' : '输入配对码连接'}
+                          <ChevronRight size={13} />
+                        </button>
+                      )}
                     </div>
                   ))
                 )}
@@ -754,7 +789,7 @@ export default function App() {
                 <p>
                   Apple TV 与 HomePod 属于同一音频组时会合并显示。
                   <br />
-                  选择合并后的目标，即可通过组内主设备连接。
+                  明确发现一台 HomePod 和一台 Apple TV 时，会先启动 HomePod，再让 Apple TV 加入。
                 </p>
               </div>
             </section>
@@ -961,7 +996,8 @@ export default function App() {
               <strong>选择家中的 AirPlay 设备</strong>
               <p>
                 让 home 与 Apple TV 位于同一局域网，将 HomePod 设为 Apple TV
-                的默认音频输出。发现同组设备后会自动合并，选择标有「Apple TV + HomePod」的目标即可。
+                的默认音频输出。发现同组设备后会自动合并。两成员组合可分别配对，选择一次即可按
+                HomePod 优先的顺序启动。
               </p>
             </li>
             <li>
@@ -997,7 +1033,7 @@ export default function App() {
         >
           <p className="modal-intro">
             {pinWaiting
-              ? '请输入 Apple TV 屏幕上显示的四位配对码。'
+              ? '请输入设备显示或提示的四位配对码。'
               : state.pairing.status === 'verifying'
                 ? '正在验证配对码…'
                 : '正在连接设备，请等待配对提示…'}

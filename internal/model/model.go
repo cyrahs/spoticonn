@@ -34,6 +34,9 @@ type Device struct {
 type DeviceView struct {
 	Device
 	Group            bool           `json:"group,omitempty"`
+	Staged           bool           `json:"staged,omitempty"`
+	AudioDeviceID    string         `json:"audio_device_id,omitempty"`
+	JoinDeviceID     string         `json:"join_device_id,omitempty"`
 	WaitingForLeader bool           `json:"waiting_for_leader,omitempty"`
 	Members          []DeviceMember `json:"members,omitempty"`
 }
@@ -43,6 +46,7 @@ type DeviceMember struct {
 	Name   string `json:"name"`
 	Model  string `json:"model"`
 	Online bool   `json:"online"`
+	Paired bool   `json:"paired"`
 }
 
 type PairingSecret struct {
@@ -96,6 +100,8 @@ type Playback struct {
 	AccountID    string    `json:"account_id"`
 	Status       string    `json:"status"`
 	OutputStatus string    `json:"output_status"`
+	GroupStatus  string    `json:"group_status,omitempty"`
+	GroupReason  string    `json:"group_reason,omitempty"`
 	Error        string    `json:"error,omitempty"`
 	Recovering   bool      `json:"recovering"`
 	Track        *Track    `json:"track"`

@@ -227,13 +227,16 @@ const livingRoom: State['devices'][number] = {
   online: true,
   paired: false,
   group: true,
+  staged: true,
+  audio_device_id: 'pod',
+  join_device_id: 'tv',
   members: [
     { id: 'tv', name: 'Living Room', model: 'AppleTV14,1', online: true },
     { id: 'pod', name: 'Living Room (2)', model: 'AudioAccessory6,1', online: true },
   ],
 }
 
-it('shows one Apple TV + HomePod output and selects and pairs its connection endpoint', async () => {
+it('shows one staged output and pairs each physical member', async () => {
   const state: State = structuredClone(empty)
   state.devices = [structuredClone(livingRoom)]
   const fetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
@@ -247,7 +250,7 @@ it('shows one Apple TV + HomePod output and selects and pairs its connection end
   render(<App />)
   const target = await screen.findByRole('button', { name: '选择 Living Room' })
   expect(screen.getByText('Apple TV + HomePod')).toBeDefined()
-  expect(screen.getByText('通过 Apple TV 连接')).toBeDefined()
+  expect(screen.getByText('先启动 HomePod，再加入 Apple TV')).toBeDefined()
   expect(screen.queryByRole('button', { name: '选择 Living Room (2)' })).toBeNull()
   await user.click(target)
   await waitFor(() => expect(target.getAttribute('aria-pressed')).toBe('true'))
@@ -258,13 +261,23 @@ it('shows one Apple TV + HomePod output and selects and pairs its connection end
       body: JSON.stringify({ ...empty.settings, target_id: 'tv' }),
     }),
   )
-  await user.click(screen.getByRole('button', { name: '输入配对码连接' }))
+  await user.click(screen.getByRole('button', { name: '配对 HomePod' }))
   await waitFor(() =>
     expect(fetch).toHaveBeenCalledWith(
       '/api/airplay/pairings',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ device_id: 'tv' }),
+        body: JSON.stringify({ device_id: 'tv', member_id: 'pod' }),
+      }),
+    ),
+  )
+  await user.click(screen.getByRole('button', { name: '配对 Apple TV' }))
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/airplay/pairings',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ device_id: 'tv', member_id: 'tv' }),
       }),
     ),
   )
@@ -273,7 +286,9 @@ it('shows one Apple TV + HomePod output and selects and pairs its connection end
 it('keeps the saved group selected and disables connection while its leader is unavailable', async () => {
   const state: State = structuredClone(empty)
   state.settings.target_id = 'tv'
-  state.devices = [{ ...structuredClone(livingRoom), online: false, waiting_for_leader: true }]
+  state.devices = [
+    { ...structuredClone(livingRoom), staged: false, online: false, waiting_for_leader: true },
+  ]
   vi.stubGlobal(
     'fetch',
     vi.fn().mockImplementation(async () => new Response(JSON.stringify(state))),
@@ -288,4 +303,29 @@ it('keeps the saved group selected and disables connection while its leader is u
   expect(
     (screen.getByRole('button', { name: '输入配对码连接' }) as HTMLButtonElement).disabled,
   ).toBe(true)
+})
+
+it('keeps a staged group selectable with an offline TV and shows its degradation', async () => {
+  const state: State = structuredClone(empty)
+  state.devices = [structuredClone(livingRoom)]
+  state.devices[0].members![0].online = false
+  state.playback.status = 'playing'
+  state.playback.group_status = 'group_degraded_offline'
+  state.playback.group_reason = 'Apple TV 离线，HomePod 继续播放'
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockImplementation(async () => new Response(JSON.stringify(state))),
+  )
+  render(<App />)
+  const target = (await screen.findByRole('button', {
+    name: '选择 Living Room',
+  })) as HTMLButtonElement
+  expect(target.disabled).toBe(false)
+  expect(
+    (screen.getByRole('button', { name: '配对 Apple TV' }) as HTMLButtonElement).disabled,
+  ).toBe(true)
+  expect((screen.getByRole('button', { name: '配对 HomePod' }) as HTMLButtonElement).disabled).toBe(
+    false,
+  )
+  expect(screen.getByText('Apple TV 离线，HomePod 继续播放')).toBeDefined()
 })
