@@ -406,7 +406,7 @@ func (g *groupOutput) runMember(c *groupCycle, anchor int64, number int) *member
 			// A generic engine error may have arrived just before Open returns
 			// its more specific, typed authentication failure.
 			g.mu.Lock()
-			if a.failure != nil && a.failure.reason == "error" {
+			if a.failure != nil && a.failure.role == "apple_tv" && a.failure.reason == "error" {
 				a.failure.reason = reason
 			}
 			g.mu.Unlock()

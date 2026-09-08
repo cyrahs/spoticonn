@@ -415,3 +415,29 @@ func TestHomePodTimelineChangeBeforeStartDoesNotWaitOrRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestTypedAuthenticationErrorOnlyRefinesAppleTVFailure(t *testing.T) {
+	for _, role := range []string{"homepod", "apple_tv"} {
+		t.Run(role, func(t *testing.T) {
+			g, p, events := testGroup(t)
+			logs := groupLogs(g)
+			g.open = func(_ context.Context, _ Config, _ model.Device, _ model.PairingSecret, _, _ int, cb func(string)) (timedOutput, error) {
+				if role == "homepod" {
+					g.primaryStatus("error")
+				} else {
+					cb("error")
+				}
+				return nil, ErrAuthFailed
+			}
+			close(p.ack)
+			g.Begin()
+			_ = g.Write(make([]byte, 3528))
+			state, reason := "group_degraded_auth", "auth"
+			if role == "homepod" {
+				state, reason = "group_degraded_homepod_error", "error"
+			}
+			waitGroup(t, events, state)
+			waitLog(t, logs, "role="+role, "reason="+reason, "phase=connect")
+		})
+	}
+}
