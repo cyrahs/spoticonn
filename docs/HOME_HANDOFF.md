@@ -113,8 +113,8 @@ sudo k3s kubectl -n spoticonn logs deployment/spoticonn
 ## 第一阶段：真实链路
 
 1. 用户从内网／VPN 打开网页并登录，确认两个引擎都可用。
-2. 网页中发现合体设备，记录显示名称、model 和稳定 device ID。不要因看到多个相关记录就直接选择单个 HomePod。
-3. 根据设备要求完成 PIN 配对，选定输出。
+2. 网页中发现组合设备，记录显示名称、model、稳定 device ID 和成员角色。两成员组合现在从 HomePod 启动音频，再加入 Apple TV；其他拓扑仍走主设备路径。
+3. 根据设备要求分别完成成员 PIN 配对，选定组合输出。按 [issue #5 验收表](ISSUE_5_VALIDATION.md) 记录冷启动对照和两种 iOS 控制结果。
 4. 网页添加第一个账号，点击「登录 Spotify」，由用户授权后将浏览器中的完整 loopback 回调地址粘贴回管理网页；地址中的 `code` 和 `state` 必须保留，不能写进验收日志。无需在服务器开放 36842 端口，也无需启动临时 Spotify 配对设备。
 5. 确认变为常驻会话后，再在 Spotify 选择正式名称播放；记录出声耗时。
 6. 确认 Apple TV 待机、电视关闭时仍可出声。必要时检查 Apple TV 的 AirPlay 访问设置和默认输出，不自动改变用户既有家庭音频配置。

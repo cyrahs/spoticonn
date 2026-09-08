@@ -9,8 +9,7 @@ import (
 	"spoticonn/internal/model"
 )
 
-// Target keeps the actual connection endpoint separate from its public name and
-// group members. A missing/ambiguous leader is never replaced by a follower.
+// Target retains the advertised identity and every physical transport record.
 type Target struct {
 	Device   model.Device
 	Members  []model.Device
@@ -32,10 +31,35 @@ func (t Target) Matches(id string) bool {
 }
 
 func (t Target) Ready() error {
+	if pod, _, ok := t.HomeTheater(); ok {
+		if !pod.Online {
+			return errors.New("组合的 HomePod 尚未上线，无法启动音频")
+		}
+		return nil
+	}
 	if t.Group && (t.LeaderID == "" || !t.Device.Online) {
 		return errors.New("音频组的主设备尚未就绪，请等待主设备上线后重试")
 	}
 	return nil
+}
+
+// HomeTheater deliberately recognizes only an unambiguous native pair. Larger
+// groups (including stereo pairs) keep their existing leader routing until their
+// member topology has been validated. Names alone never enable staged playback.
+func (t Target) HomeTheater() (pod, tv model.Device, ok bool) {
+	if !t.Group || len(t.Members) != 2 {
+		return
+	}
+	for _, d := range t.Members {
+		switch {
+		case strings.HasPrefix(strings.ToLower(d.Model), "audioaccessory"):
+			pod = d
+		case strings.HasPrefix(strings.ToLower(d.Model), "appletv"):
+			tv = d
+		}
+	}
+	ok = pod.ID != "" && tv.ID != ""
+	return
 }
 
 func (t Target) View(pairings map[string]model.PairingSecret) model.DeviceView {
@@ -43,10 +67,21 @@ func (t Target) View(pairings map[string]model.PairingSecret) model.DeviceView {
 	v.Name = t.Name
 	v.TXT = nil
 	_, v.Paired = pairings[t.Device.ID]
+	pod, tv, staged := t.HomeTheater()
+	if staged {
+		v.Staged = true
+		v.AudioDeviceID, v.JoinDeviceID = pod.ID, tv.ID
+		v.Online = pod.Online
+		_, v.Paired = pairings[pod.ID]
+		v.WaitingForLeader = false
+	}
 	if t.Group {
-		v.Paired = v.Paired && t.LeaderID != ""
+		if !staged {
+			v.Paired = v.Paired && t.LeaderID != ""
+		}
 		for _, d := range t.Members {
-			v.Members = append(v.Members, model.DeviceMember{ID: d.ID, Name: displayName(d.Name), Model: d.Model, Online: d.Online})
+			_, paired := pairings[d.ID]
+			v.Members = append(v.Members, model.DeviceMember{ID: d.ID, Name: displayName(d.Name), Model: d.Model, Online: d.Online, Paired: paired})
 		}
 	}
 	return v
@@ -106,6 +141,11 @@ func Targets(devices map[string]model.Device, now time.Time) []Target {
 		} else {
 			// This placeholder cannot be used as a transport endpoint.
 			t.Device = model.Device{ID: "group:" + gid}
+		}
+		if _, tv, ok := t.HomeTheater(); ok {
+			// Keep a stable display identity even if the TV is offline or the
+			// native leader changes. This is not the initial audio endpoint.
+			t.Device = tv
 		}
 		t.Name = t.Device.TXT["gpn"] // TXT values are plain text, not DNS-escaped labels.
 		if t.Name == "" {

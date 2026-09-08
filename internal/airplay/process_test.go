@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -128,6 +129,11 @@ func TestAirPlayEngineProcess(t *testing.T) {
 	var pipe string
 	pair := false
 	for i, v := range os.Args {
+		if v == "--ptp-daemon" {
+			for {
+				time.Sleep(time.Second)
+			}
+		}
 		if v == "--pair-setup" {
 			pair = true
 		}
@@ -164,10 +170,22 @@ func TestAirPlayEngineProcess(t *testing.T) {
 		}
 	}()
 	sc := bufio.NewScanner(f)
+	var requested int64
+	join := false
 	for sc.Scan() {
+		if value, ok := strings.CutPrefix(sc.Text(), "START_UNIX_MS="); ok {
+			requested, _ = strconv.ParseInt(value, 10, 64)
+		}
 		switch sc.Text() {
+		case "START_JOIN=1":
+			join = true
 		case "ACTION=START":
-			fmt.Fprintln(os.Stderr, "[STATUS] started at_unix_ms=1")
+			if join {
+				fmt.Fprintf(os.Stderr, "[STATUS] started requested_unix_ms=%d at_unix_ms=%d\n", requested, requested+17)
+			} else {
+				fmt.Fprintln(os.Stderr, "[STATUS] started at_unix_ms=1")
+			}
+			join = false
 		case "ACTION=FLUSH":
 			buffered.Store(false)
 			fmt.Fprintln(os.Stderr, "[STATUS] flushed")
@@ -176,4 +194,57 @@ func TestAirPlayEngineProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestSenderJoinAcknowledgementAndDuplicateStart(t *testing.T) {
+	binary := fakeBinary(t)
+	events := make(chan string, 10)
+	s, err := Open(context.Background(), Config{Binary: binary, RuntimeDir: t.TempDir()}, model.Device{Address: "127.0.0.1", Port: 7000}, model.PairingSecret{}, 23, 48000, func(state string) { events <- state })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	at, err := s.Join(ctx, 12345)
+	if err != nil || at != 12362 {
+		t.Fatal("did not use sender acknowledgement", at, err)
+	}
+	if _, err = s.Join(ctx, 23456); err == nil {
+		t.Fatal("duplicate join accepted")
+	}
+	s.Begin()
+	if err = s.Write(make([]byte, 1920)); err != nil {
+		t.Fatal(err)
+	}
+	<-events
+	select {
+	case <-events:
+		t.Fatal("duplicate Begin sent another START")
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestSharedPTPRejectsImplicitNTPTimingFallback(t *testing.T) {
+	binary := fakeBinary(t)
+	s, err := Open(context.Background(), Config{Binary: binary, RuntimeDir: t.TempDir(), SharedPTP: true}, model.Device{Address: "127.0.0.1", Port: 7000}, model.PairingSecret{}, 23, 44100, func(string) {})
+	if err == nil {
+		s.Close()
+		t.Fatal("mixed PTP and NTP timing accepted in a group")
+	}
+}
+
+func TestMalformedAndUnsolicitedStartsCannotConfirmPlayback(t *testing.T) {
+	for _, line := range []string{"[STATUS] started at_unix_ms=oops", "[STATUS] started at_unix_ms=0", "[STATUS] started requested_unix_ms=123"} {
+		s := &Sender{started: make(chan struct{}), startSent: true, status: func(string) { t.Error("invalid start published") }}
+		s.scan(strings.NewReader(line + "\n"))
+		if s.anchor != 0 {
+			t.Fatal("invalid anchor accepted")
+		}
+	}
+	s := &Sender{started: make(chan struct{}), status: func(string) { t.Error("unsolicited start published") }}
+	s.scan(strings.NewReader("[STATUS] started at_unix_ms=123\n"))
+	if s.anchor != 0 {
+		t.Fatal("unsolicited anchor accepted")
+	}
 }

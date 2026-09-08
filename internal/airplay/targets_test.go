@@ -49,7 +49,7 @@ func TestAppleTVHomePodGroup(t *testing.T) {
 		}
 	}
 	view := target.View(map[string]model.PairingSecret{"6a9cdd7721c7": {Credentials: "homepod-key"}})
-	if view.Paired || !view.Group || !view.Online || len(view.Members) != 2 || view.Members[1].Name != "Living Room (2)" {
+	if !view.Paired || !view.Staged || view.AudioDeviceID != "6a9cdd7721c7" || view.JoinDeviceID != "0603165e17b1" || !view.Group || !view.Online || len(view.Members) != 2 || view.Members[1].Name != "Living Room (2)" {
 		t.Fatalf("wrong display or credentials: %+v", view)
 	}
 	b, _ := json.Marshal(view)
@@ -65,7 +65,11 @@ func TestAppleTVHomePodGroup(t *testing.T) {
 func TestGroupRequiresUnambiguousLiveLeader(t *testing.T) {
 	for _, scenario := range []string{"missing", "offline", "expired", "conflicting", "leadership changed"} {
 		t.Run(scenario, func(t *testing.T) {
+			// Non-home-theater groups still require a live, unambiguous leader.
 			devices := livingRoom(t)
+			d := devices["6a9cdd7721c7"]
+			d.Model = "OtherSpeaker"
+			devices[d.ID] = d
 			tv := devices["0603165e17b1"]
 			switch scenario {
 			case "missing":
