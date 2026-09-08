@@ -78,7 +78,7 @@ func OpenHomeTheater(ctx context.Context, cfg Config, target Target, pairings ma
 		}
 		return Open(ctx, cfg, d, p, volume, rate, cb)
 	}
-	diagnostic("组合角色：HomePod 接收初始音频，Apple TV 为待加入成员；控制由 Spotify Connect 提供")
+	diagnostic("组合角色：HomePod 接收初始音频，Apple TV 为待加入成员；两成员的远程控制回传至当前 Spotify 会话")
 	primary, err := g.open(child, cfg, pod, pairings[pod.ID], volume, rate, g.primaryStatus)
 	if err != nil {
 		cancel()

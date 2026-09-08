@@ -671,6 +671,14 @@ export default function App() {
                 />
                 <span>{volume}%</span>
               </div>
+              <details className="remote-control-help">
+                <summary>iOS 控制中心的控制范围</summary>
+                <p>
+                  暂停效果需在设备上确认；若按钮无效，请使用 Spotify 或本页暂停。 Apple TV + HomePod
+                  组合暂停后，请从 Spotify 恢复播放。 iOS
+                  原生恢复、切歌和音量尚未完成实机验证，显示曲目信息不代表这些控制均可用。
+                </p>
+              </details>
               {state.playback.group_status && (
                 <p role="status" className="group-playback-status">
                   {state.playback.group_reason || groupStatus[state.playback.group_status]}

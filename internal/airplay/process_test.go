@@ -257,6 +257,9 @@ func TestAirPlayEngineProcess(t *testing.T) {
 		}
 		switch sc.Text() {
 		case "ACTION=SENDMETA":
+			if event := os.Getenv("SPOTICONN_TEST_AIRPLAY_REMOTE"); event != "" {
+				fmt.Fprintln(os.Stdout, event)
+			}
 			if artworkFile != "" && commandLog != nil {
 				data, err := os.ReadFile(artworkFile)
 				if err != nil {

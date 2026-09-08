@@ -42,15 +42,18 @@ type runtimeAccount struct {
 	retryAt           time.Time
 	failures          int
 	statusFailures    int
+	pauseUnconfirmed  bool
 	last              model.PlayerStatus
 	authorization     *spotify.Authorization
 	login             *spotify.Login
 }
 type event struct {
-	kind, id   string
-	generation uint64
-	spotify    spotify.Event
-	status     string
+	kind, id         string
+	generation       uint64
+	spotify          spotify.Event
+	status           string
+	remote           airplay.RemoteCommand
+	playerGeneration uint64
 }
 type Manager struct {
 	mu                                 sync.Mutex // snapshots and runtime fields
@@ -64,10 +67,13 @@ type Manager struct {
 	devices                            map[string]model.Device
 	output                             Output
 	outputRate                         int
+	outputParked                       bool
 	outputGeneration                   uint64
 	outputRetryAt                      time.Time
 	outputRetryAccount                 string
 	outputFailures                     int
+	remoteLast                         map[string]time.Time
+	remoteBarrier                      time.Time
 	playback                           model.Playback
 	diagnostics                        []model.Diagnostic
 	pairing                            *airplay.Pairing
@@ -118,10 +124,14 @@ func (m *Manager) emit(e event) {
 	// process waits for its output readers. Coalesce repeated notifications,
 	// keeping their latest order; playback events are checked against live state.
 	m.eventMu.Lock()
+	if e.kind == "remote" && (e.remote.Context == nil || e.remote.Context.Err() != nil) {
+		m.eventMu.Unlock()
+		return // an old member must not replace a newer member's queued request
+	}
 	for i := len(m.events) - 1; i >= 0; i-- {
 		old := m.events[i]
 		if old.kind == e.kind && old.id == e.id && (old.generation < e.generation ||
-			(old.generation == e.generation && old.spotify.Type == e.spotify.Type && old.status == e.status)) {
+			(old.generation == e.generation && old.spotify.Type == e.spotify.Type && old.status == e.status && old.remote.Action == e.remote.Action && old.remote.DeviceID == e.remote.DeviceID)) {
 			m.events = append(m.events[:i], m.events[i+1:]...)
 		}
 	}
@@ -309,6 +319,7 @@ func (m *Manager) start(a model.Account) {
 	r.status = "starting"
 	r.errorText = ""
 	r.statusFailures = 0
+	r.pauseUnconfirmed = false
 	login := r.login
 	m.mu.Unlock()
 	state := m.store.Snapshot()
@@ -385,6 +396,9 @@ func (m *Manager) reconcile() {
 		if err == nil {
 			m.mu.Lock()
 			r.last = status
+			if status.Paused || status.Stopped {
+				r.pauseUnconfirmed = false
+			}
 			r.statusFailures = 0
 			r.errorText = ""
 			r.failures = 0
@@ -523,6 +537,10 @@ func (m *Manager) stopAccount(id string) {
 }
 
 func (m *Manager) handle(e event) {
+	if e.kind == "remote" {
+		m.handleRemote(e)
+		return
+	}
 	if e.kind == "output" {
 		if e.generation != m.outputGeneration {
 			return
@@ -544,6 +562,15 @@ func (m *Manager) handle(e event) {
 				}
 			})
 		case "clock_stalled", "error", "disconnected":
+			m.mu.Lock()
+			paused := m.playback.Status == "paused" && !m.playback.Recovering
+			m.mu.Unlock()
+			if paused {
+				m.detach()
+				m.closeOutput()
+				m.setPlayback(func(p *model.Playback) { p.OutputStatus = "disconnected" })
+				return // losing a parked sender must never resume a user pause
+			}
 			m.failOutput("AirPlay 连接中断；Spotify 已暂停，可重试播放")
 		}
 		return
@@ -582,6 +609,9 @@ func (m *Manager) handle(e event) {
 	defer cancel()
 	switch e.spotify.Type {
 	case "playing":
+		if r.pauseUnconfirmed {
+			return // source pause failed: keep audio isolated until pause is confirmed
+		}
 		status, err := p.Status(ctx)
 		if err != nil || status.Paused || status.Stopped {
 			return
@@ -599,8 +629,15 @@ func (m *Manager) handle(e event) {
 		if current {
 			// Our own pause/seek/resume sequence can enqueue a pause event that
 			// arrives after resume. Reconcile it with the live player first.
-			if live, err := p.Status(ctx); err == nil && !live.Paused && !live.Stopped && e.spotify.Type != "inactive" {
+			live, statusErr := p.Status(ctx)
+			if statusErr == nil && !live.Paused && !live.Stopped && e.spotify.Type != "inactive" {
 				return
+			}
+			if statusErr == nil && (live.Paused || live.Stopped) {
+				r.pauseUnconfirmed = false
+			}
+			if m.outputParked && (e.spotify.Type == "paused" || e.spotify.Type == "not_playing") {
+				return // the synchronous pause path already cleared and parked audio
 			}
 			m.detach()
 			if m.output != nil {
@@ -609,6 +646,7 @@ func (m *Manager) handle(e event) {
 					return
 				}
 				_ = m.output.Standby()
+				m.outputParked = true
 			}
 			if e.spotify.Type == "inactive" || e.spotify.Type == "stopped" {
 				m.cancelOutputRecovery()
@@ -695,6 +733,8 @@ func (m *Manager) detach() {
 }
 func (m *Manager) closeOutput() {
 	m.outputGeneration++
+	m.outputParked = false
+	m.remoteLast = nil
 	if m.output != nil {
 		m.output.Close()
 		m.output = nil
@@ -727,6 +767,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
 	defer cancel()
 	if old == id && m.output != nil && m.outputRate == rate {
+		m.outputParked = false
 		m.output.Begin()
 		r.player.Route(rate, m.output.Write)
 		_ = m.output.Metadata(status.Track)
@@ -759,13 +800,18 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		v.Track = status.Track
 	})
 	generation := m.outputGeneration
+	playerGeneration := r.generation
+	cfg := m.airplayConfig()
+	cfg.RemoteControl = func(command airplay.RemoteCommand) {
+		m.emit(event{kind: "remote", id: id, generation: generation, playerGeneration: playerGeneration, remote: command})
+	}
 	var output Output
 	var err error
 	cb := func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) }
 	if _, _, staged := target.HomeTheater(); staged {
-		output, err = m.cfg.OpenGroupOutput(m.ctx, m.airplayConfig(), target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
+		output, err = m.cfg.OpenGroupOutput(m.ctx, cfg, target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
 	} else {
-		output, err = m.cfg.OpenOutput(m.ctx, m.airplayConfig(), target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
+		output, err = m.cfg.OpenOutput(m.ctx, cfg, target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
 	}
 	if err != nil {
 		return err
@@ -797,6 +843,9 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 }
 
 func (m *Manager) failOutput(message string) {
+	m.mu.Lock()
+	shouldRecover := m.playback.Status != "paused" || m.playback.Recovering
+	m.mu.Unlock()
 	m.detach()
 	m.closeOutput()
 	m.mu.Lock()
@@ -809,7 +858,7 @@ func (m *Manager) failOutput(message string) {
 		cancel()
 	}
 	m.setPlayback(func(p *model.Playback) { p.Status = "paused"; p.OutputStatus = "error"; p.Error = message })
-	if id != "" && m.store.Snapshot().Settings.TargetID != "" {
+	if shouldRecover && id != "" && m.store.Snapshot().Settings.TargetID != "" {
 		m.outputFailures++
 		m.outputRetryAccount = id
 		m.outputRetryAt = time.Now().Add(time.Duration(min(60, 1<<min(m.outputFailures, 6))) * time.Second)
@@ -1042,6 +1091,14 @@ func (m *Manager) setVolume(ctx context.Context, v int, spotifyToo bool) error {
 func (m *Manager) Playback(ctx context.Context, action string, value int64) error {
 	m.op.Lock()
 	defer m.op.Unlock()
+	if action != "volume" {
+		m.remoteBarrier = time.Now() // queued receiver controls cannot undo newer UI intent
+	}
+	return m.playbackCommand(ctx, action, value)
+}
+
+// Caller holds op; receiver controls and the management API share this path.
+func (m *Manager) playbackCommand(ctx context.Context, action string, value int64) error {
 	if action == "pause" || action == "stop" {
 		m.cancelOutputRecovery()
 	}
@@ -1062,14 +1119,40 @@ func (m *Manager) Playback(ctx context.Context, action string, value int64) erro
 	if r == nil || r.player == nil {
 		return errors.New("请先在 Spotify 中选择此设备并播放")
 	}
-	if action == "stop" {
-		if err := r.player.Command(ctx, "pause", nil); err != nil {
-			return err
-		}
+	if action == "resume" {
+		r.pauseUnconfirmed = false
+	}
+	if action == "pause" || action == "stop" {
+		// Stop the source and queued PCM immediately. Do not wait for a Spotify
+		// websocket event, which can be delayed or absent after a remote pause.
+		err := r.player.Command(ctx, "pause", nil)
+		r.pauseUnconfirmed = err != nil
 		m.detach()
-		m.closeOutput()
-		m.setPlayback(func(v *model.Playback) { v.Status = "paused"; v.OutputStatus = "disconnected" })
-		return nil
+		r.player.Drain()
+		if action == "stop" || err != nil {
+			m.closeOutput()
+		} else if m.output != nil {
+			err = m.output.Flush(ctx)
+			if err == nil {
+				err = m.output.Standby()
+			}
+			if err != nil {
+				m.closeOutput()
+			} else {
+				m.outputParked = true
+			}
+		}
+		m.setPlayback(func(v *model.Playback) {
+			v.Status = "paused"
+			v.OutputStatus = "connected"
+			if m.output == nil {
+				v.OutputStatus = "disconnected"
+			}
+			if err != nil {
+				v.Error = "暂停控制失败，音频输出已断开；请通过 Spotify 重试"
+			}
+		})
+		return err
 	}
 	if action == "seek" {
 		return r.player.Command(ctx, action, map[string]any{"position": value})
