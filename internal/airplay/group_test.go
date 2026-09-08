@@ -179,7 +179,7 @@ func TestStagedJoinWaitsForAcknowledgedHomePodAndKeepsItsStream(t *testing.T) {
 }
 
 func TestGroupJoinFailuresNeverStopOrRetryHomePod(t *testing.T) {
-	for _, scenario := range []string{"offline", "clock", "open", "start", "timeline", "disconnect", "backpressure"} {
+	for _, scenario := range []string{"offline", "clock", "open", "auth_required", "auth_failed", "start", "timeline", "disconnect", "backpressure"} {
 		t.Run(scenario, func(t *testing.T) {
 			g, p, events := testGroup(t)
 			tv := &testMember{anchor: p.anchor + 10}
@@ -199,15 +199,20 @@ func TestGroupJoinFailuresNeverStopOrRetryHomePod(t *testing.T) {
 			g.open = func(ctx context.Context, _ Config, _ model.Device, _ model.PairingSecret, _, _ int, cb func(string)) (timedOutput, error) {
 				opens.Add(1)
 				tv.ctx, tv.callback = ctx, cb
-				if scenario == "open" {
+				switch scenario {
+				case "open":
 					return nil, errors.New("secret must never surface")
+				case "auth_required":
+					return nil, ErrAuthRequired
+				case "auth_failed":
+					return nil, ErrAuthFailed
 				}
 				return tv, nil
 			}
 			close(p.ack)
 			g.Begin()
 			_ = g.Write(make([]byte, 3528))
-			states := map[string]string{"offline": "group_degraded_offline", "clock": "group_degraded_clock", "open": "group_degraded_connect", "start": "group_degraded_start", "timeline": "group_degraded_timeline", "disconnect": "group_degraded_member", "backpressure": "group_degraded_member"}
+			states := map[string]string{"offline": "group_degraded_offline", "clock": "group_degraded_clock", "open": "group_degraded_connect", "auth_required": "group_degraded_auth", "auth_failed": "group_degraded_auth", "start": "group_degraded_start", "timeline": "group_degraded_timeline", "disconnect": "group_degraded_member", "backpressure": "group_degraded_member"}
 			if scenario == "disconnect" {
 				waitGroup(t, events, "group_joined")
 				tv.callback("disconnected")

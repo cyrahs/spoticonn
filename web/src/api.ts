@@ -35,19 +35,27 @@ export interface Account {
   error?: string
   authorization?: { url: string; expires_at: string }
 }
-export interface Device {
+export interface Authentication {
+  requirement: 'none' | 'pin' | 'password' | 'access_control' | 'unknown'
+  password_saved: boolean
+}
+export interface DeviceMember {
   id: string
   name: string
-  address: string
   model: string
   online: boolean
+  paired?: boolean
+  authentication?: Authentication
+}
+export interface Device extends DeviceMember {
+  address: string
   paired: boolean
   group?: boolean
   staged?: boolean
   audio_device_id?: string
   join_device_id?: string
   waiting_for_leader?: boolean
-  members?: { id: string; name: string; model: string; online: boolean; paired?: boolean }[]
+  members?: DeviceMember[]
 }
 export interface Track {
   uri: string

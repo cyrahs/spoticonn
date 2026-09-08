@@ -117,6 +117,12 @@ func TestGroupPairingStoresCredentialsUnderActualEndpoint(t *testing.T) {
 		t.Run(member, func(t *testing.T) {
 			m, _, _, _ := setup(t)
 			setupGroup(t, m)
+			_ = m.store.Update(func(s *store.State) error {
+				secret := s.Pairings[member]
+				secret.Password = "existing-password"
+				s.Pairings[member] = secret
+				return nil
+			})
 			argsFile := filepath.Join(t.TempDir(), "pair-args")
 			t.Setenv("SPOTICONN_TEST_PAIR_ARGS", argsFile)
 			binary := filepath.Join(t.TempDir(), "fake-pair")
@@ -139,7 +145,7 @@ func TestGroupPairingStoresCredentialsUnderActualEndpoint(t *testing.T) {
 			for time.Now().Before(deadline) {
 				if p := m.Snapshot().Pairing; p != nil && p.Status == "paired" {
 					saved := m.store.Snapshot()
-					if saved.Pairings[member].Credentials != strings.Repeat("a", 192) {
+					if saved.Pairings[member].Credentials != strings.Repeat("a", 192) || saved.Pairings[member].Password != "existing-password" {
 						t.Fatal("pairing credentials were saved to the wrong physical device")
 					}
 					args, err := os.ReadFile(argsFile)
@@ -163,7 +169,7 @@ func TestGroupDegradationDoesNotPauseOrReconnectPrimary(t *testing.T) {
 	}
 	m.handle(playing("a", 1))
 	m.handle(event{kind: "output", generation: m.outputGeneration, status: "playing"})
-	for _, state := range []string{"group_joining", "group_degraded_offline", "group_degraded_connect", "group_degraded_start"} {
+	for _, state := range []string{"group_joining", "group_degraded_offline", "group_degraded_auth", "group_degraded_connect", "group_degraded_start"} {
 		m.handle(event{kind: "output", generation: m.outputGeneration, status: state})
 		view := m.Snapshot().Playback
 		if a.state.Paused || view.Status != "playing" || view.Recovering || m.output == nil || view.GroupStatus != state {

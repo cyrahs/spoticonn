@@ -23,6 +23,9 @@ import (
 type Config struct {
 	Binary, RuntimeDir, InterfaceIP string
 	SharedPTP                       bool
+	RemoteControl                   func(RemoteCommand) // must not block the engine reader
+	Artwork                         *ArtworkCache
+	Diagnostic                      func(string)
 }
 type Sender struct {
 	id             string
@@ -35,6 +38,7 @@ type Sender struct {
 	readyOnce      sync.Once
 	failed         chan struct{}
 	failOnce       sync.Once
+	connectError   error
 	sharedPTP      bool
 	startSent      bool
 	joinStart      bool
@@ -50,6 +54,12 @@ type Sender struct {
 	volumeTimer    *time.Timer
 	flushed        chan struct{}
 	status         func(string)
+	remoteControl  func(RemoteCommand)
+	deviceID       string
+	diagnostic     func(string)
+	runtimeDir     string
+	artworkCache   *ArtworkCache
+	artwork        *senderArtwork
 }
 
 func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSecret, volume, rate int, status func(string)) (*Sender, error) {
@@ -75,6 +85,12 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	args := []string{"--protocol", "auto", "--port", strconv.Itoa(d.Port), "--volume", strconv.Itoa(volume), "--samplerate", strconv.Itoa(rate), "--channels", "2", "--bitdepth", "16", "--cmdpipe", cmdPath, "--name", "Spoticonn", "--debug", "1"}
 	if pair.Credentials != "" {
 		args = append(args, "--auth", pair.Credentials, "--dacp", pair.DACP)
+	}
+	if pair.Password != "" {
+		args = append(args, "--password", pair.Password)
+	}
+	if Authentication(d, pair).Requirement == "password" {
+		args = append(args, "--pw", "true")
 	}
 	if cfg.InterfaceIP != "" {
 		args = append(args, "--if", cfg.InterfaceIP)
@@ -102,6 +118,8 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	}
 	cmd.WaitDelay = 2 * time.Second
 	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status, failed: make(chan struct{}), sharedPTP: cfg.SharedPTP, startConfirmed: make(chan struct{})}
+	s.remoteControl, s.deviceID = cfg.RemoteControl, d.ID
+	s.diagnostic, s.runtimeDir, s.artworkCache = cfg.Diagnostic, cfg.RuntimeDir, cfg.Artwork
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -136,15 +154,18 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	go func() {
 		scans.Wait()
 		_ = cmd.Wait()
+		unexpected := child.Err() == nil
+		cancel() // invalidate queued controls even on an unexpected process exit
 		_ = w.Close()
 		s.mu.Lock()
 		s.closed = true
 		s.cancelStartLocked()
+		s.stopArtworkLocked()
 		_ = unix.Close(fd)
 		close(s.done)
 		s.mu.Unlock()
 		_ = os.Remove(cmdPath)
-		if child.Err() == nil {
+		if unexpected {
 			s.status("disconnected")
 		}
 	}()
@@ -159,10 +180,10 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		return s, nil
 	case <-s.failed:
 		s.Close()
-		return nil, errors.New("AirPlay 连接或共享时钟失败")
+		return nil, s.connectionError()
 	case <-s.done:
 		cancel()
-		return nil, errors.New("AirPlay 连接失败，请检查配对和网络")
+		return nil, s.connectionError()
 	case <-ctx.Done():
 		s.Close()
 		return nil, ctx.Err()
@@ -172,11 +193,26 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	}
 }
 
+func (s *Sender) connectionError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connectError != nil {
+		return s.connectError
+	}
+	return errors.New("AirPlay 连接失败，请检查设备认证、访问设置、网络及共享时钟")
+}
+
 func (s *Sender) scan(r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 256<<10)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if action := remoteAction(line); action != "" {
+			if s.remoteControl != nil && s.ctx.Err() == nil {
+				s.remoteControl(RemoteCommand{Context: s.ctx, DeviceID: s.deviceID, Action: action, ReceivedAt: time.Now()})
+			}
+			continue
+		}
 		i := strings.Index(line, "[STATUS] ")
 		if i < 0 {
 			continue
@@ -222,7 +258,26 @@ func (s *Sender) scan(r io.Reader) {
 				s.flushed = nil
 			}
 			s.mu.Unlock()
+		case strings.HasPrefix(line, "mrp artwork=rejected "):
+			// Fixed text only: engine output can contain paths or remote data.
+			s.artworkDiagnostic("引擎已省略或清除封面")
+		case strings.HasPrefix(line, "mrp artwork=posted "):
+			if !strings.Contains(line, " status=200 ") {
+				s.artworkDiagnostic("接收端未确认封面")
+			}
 		case strings.HasPrefix(line, "error"):
+			// Only trust the structured error code; engine detail may contain secrets.
+			fields := strings.Fields(line)
+			if len(fields) > 1 {
+				s.mu.Lock()
+				switch fields[1] {
+				case "code=auth_required":
+					s.connectError = ErrAuthRequired
+				case "code=auth_failed":
+					s.connectError = ErrAuthFailed
+				}
+				s.mu.Unlock()
+			}
 			s.failOnce.Do(func() { close(s.failed) })
 			s.cancelStart()
 			s.status("error")
@@ -349,6 +404,7 @@ func (s *Sender) Begin() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.closed && !s.joinStart {
+		s.resumeArtworkLocked()
 		s.pendingStart = true
 	}
 }
@@ -427,6 +483,7 @@ func (s *Sender) Write(b []byte) error {
 }
 func (s *Sender) Flush(ctx context.Context) error {
 	s.mu.Lock()
+	s.suspendArtworkLocked()
 	s.cancelStartLocked()
 	s.resetStartLocked()
 	ch := make(chan struct{})
@@ -450,6 +507,7 @@ func (s *Sender) Flush(ctx context.Context) error {
 func (s *Sender) Standby() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.suspendArtworkLocked()
 	s.cancelStartLocked()
 	s.resetStartLocked()
 	return s.commandLocked("ACTION=STANDBY\n")
@@ -460,25 +518,27 @@ func (s *Sender) Volume(v int) error {
 	s.volume = v
 	return s.commandLocked(fmt.Sprintf("VOLUME=%d\n", v))
 }
-func (s *Sender) Metadata(t *model.Track) error {
-	if t == nil {
-		return nil
-	}
-	clean := func(v string) string { return strings.NewReplacer("\r", " ", "\n", " ", "\x00", "").Replace(v) }
-	return s.command(fmt.Sprintf("TITLE=%s\nARTIST=%s\nALBUM=%s\nITEMID=%s\nDURATION=%d\nPROGRESS=%d\nACTION=SENDMETA\n", clean(t.Name), clean(strings.Join(t.Artists, ", ")), clean(t.Album), clean(t.URI), t.Duration/1000, t.Position/1000))
-}
 func (s *Sender) Close() {
 	s.mu.Lock()
 	if s.closed {
+		a := s.artwork
 		s.mu.Unlock()
+		if a != nil {
+			<-a.done
+		}
 		return
 	}
 	s.closed = true
 	s.cancelStartLocked()
+	s.stopArtworkLocked()
+	a := s.artwork
 	s.mu.Unlock()
 	s.cancel()
 	_ = s.input.Close()
 	<-s.done
+	if a != nil {
+		<-a.done
+	}
 }
 
 type Pairing struct {

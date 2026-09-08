@@ -186,7 +186,11 @@ func (m *Manager) pauseOutput(ctx context.Context, stop bool) error {
 	}
 	m.setPlayback(func(p *model.Playback) { p.Status = "paused" })
 	if m.output == nil {
+		m.setPlayback(func(p *model.Playback) { p.OutputStatus = "disconnected" })
 		return nil
+	}
+	if !stop && m.outputParked {
+		return nil // a delayed Spotify acknowledgement must not flush twice
 	}
 	if group, ok := m.output.(interface{ CancelJoin() }); ok {
 		group.CancelJoin()
@@ -203,6 +207,9 @@ func (m *Manager) pauseOutput(ctx context.Context, stop bool) error {
 	}
 	if err != nil {
 		m.failOutput("暂停时 AirPlay 清缓冲或待机失败，输出已关闭")
+	} else {
+		m.outputParked = true
+		m.setPlayback(func(p *model.Playback) { p.OutputStatus = "connected" })
 	}
 	return err
 }

@@ -43,6 +43,7 @@ type runtimeAccount struct {
 	retryAt           time.Time
 	failures          int
 	statusFailures    int
+	pauseUnconfirmed  bool
 	last              model.PlayerStatus
 	authorization     *spotify.Authorization
 	login             *spotify.Login
@@ -54,6 +55,8 @@ type event struct {
 	status                  string
 	observed, internalPause bool
 	intent                  uint64
+	remote                  airplay.RemoteCommand
+	playerGeneration        uint64
 }
 type Manager struct {
 	mu                                 sync.Mutex // snapshots and runtime fields
@@ -67,12 +70,15 @@ type Manager struct {
 	devices                            map[string]model.Device
 	output                             Output
 	outputRate                         int
+	outputParked                       bool
 	outputGeneration                   uint64
 	outputCancel                       context.CancelFunc
 	outputRetryAt                      time.Time
 	outputRetryAccount                 string
 	outputRetryRequest                 playbackRequest
 	outputFailures                     int
+	remoteLast                         map[string]time.Time
+	remoteBarrier                      time.Time
 	playback                           model.Playback
 	diagnostics                        []model.Diagnostic
 	pairing                            *airplay.Pairing
@@ -124,10 +130,14 @@ func (m *Manager) emit(e event) {
 	// process waits for its output readers. Coalesce repeated notifications,
 	// keeping their latest order; playback events are checked against live state.
 	m.eventMu.Lock()
+	if e.kind == "remote" && (e.remote.Context == nil || e.remote.Context.Err() != nil) {
+		m.eventMu.Unlock()
+		return // an old member must not replace a newer member's queued request
+	}
 	for i := len(m.events) - 1; i >= 0; i-- {
 		old := m.events[i]
 		if old.kind == e.kind && old.id == e.id && (old.generation < e.generation ||
-			(old.generation == e.generation && old.spotify.Type == e.spotify.Type && old.status == e.status && old.internalPause == e.internalPause)) {
+			(old.generation == e.generation && old.spotify.Type == e.spotify.Type && old.status == e.status && old.internalPause == e.internalPause && old.remote.Action == e.remote.Action && old.remote.DeviceID == e.remote.DeviceID)) {
 			m.events = append(m.events[:i], m.events[i+1:]...)
 		}
 	}
@@ -276,7 +286,7 @@ func (m *Manager) discover() {
 }
 
 func (m *Manager) airplayConfig() airplay.Config {
-	c := airplay.Config{Binary: m.cfg.AirPlayBinary, RuntimeDir: m.cfg.RuntimeDir}
+	c := airplay.Config{Binary: m.cfg.AirPlayBinary, RuntimeDir: m.cfg.RuntimeDir, Diagnostic: m.diagnostic}
 	if m.cfg.Interface != "" {
 		if i, err := net.InterfaceByName(m.cfg.Interface); err == nil {
 			if addresses, err := i.Addrs(); err == nil {
@@ -316,6 +326,7 @@ func (m *Manager) start(a model.Account) {
 	r.status = "starting"
 	r.errorText = ""
 	r.statusFailures = 0
+	r.pauseUnconfirmed = false
 	login := r.login
 	m.mu.Unlock()
 	state := m.store.Snapshot()
@@ -392,6 +403,9 @@ func (m *Manager) reconcile() {
 		if err == nil {
 			m.mu.Lock()
 			r.last = status
+			if status.Paused || status.Stopped {
+				r.pauseUnconfirmed = false
+			}
 			r.statusFailures = 0
 			r.errorText = ""
 			r.failures = 0
@@ -532,6 +546,10 @@ func (m *Manager) stopAccount(id string) {
 }
 
 func (m *Manager) handle(e event) {
+	if e.kind == "remote" {
+		m.handleRemote(e)
+		return
+	}
 	if e.kind == "output" {
 		if e.generation != m.outputGeneration {
 			return
@@ -559,6 +577,15 @@ func (m *Manager) handle(e event) {
 				}
 			})
 		case "clock_stalled", "error", "disconnected":
+			m.mu.Lock()
+			paused := m.playback.Status == "paused" && !m.playback.Recovering
+			m.mu.Unlock()
+			if paused {
+				m.detach()
+				m.closeOutput()
+				m.setPlayback(func(p *model.Playback) { p.OutputStatus = "disconnected" })
+				return // losing a parked sender must never resume a user pause
+			}
 			m.failOutput("AirPlay 连接中断；Spotify 已暂停，可重试播放")
 		}
 		return
@@ -602,6 +629,9 @@ func (m *Manager) handle(e event) {
 	defer cancel()
 	switch e.spotify.Type {
 	case "playing":
+		if r.pauseUnconfirmed {
+			return // source pause failed: keep audio isolated until pause is confirmed
+		}
 		status, err := p.Status(ctx)
 		if err != nil || status.Paused || status.Stopped {
 			return
@@ -634,6 +664,9 @@ func (m *Manager) handle(e event) {
 				}
 				m.mu.Unlock()
 				return
+			}
+			if err == nil && (live.Paused || live.Stopped) {
+				r.pauseUnconfirmed = false
 			}
 			_ = m.pauseOutput(ctx, e.spotify.Type == "inactive" || e.spotify.Type == "stopped")
 		}
@@ -719,6 +752,8 @@ func (m *Manager) closeOutput() {
 		m.outputCancel()
 		m.outputCancel = nil
 	}
+	m.outputParked = false
+	m.remoteLast = nil
 	if m.output != nil {
 		m.output.Close()
 		m.output = nil
@@ -771,6 +806,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		if !m.requestCurrent(q) {
 			return errPlaybackSuperseded
 		}
+		m.outputParked = false
 		m.output.Begin()
 		r.player.Route(rate, m.output.Write)
 		_ = m.output.Metadata(status.Track)
@@ -807,13 +843,18 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	}
 	r.player.Drain()
 	generation := m.outputGeneration
+	playerGeneration := r.generation
+	cfg := m.airplayConfig()
+	cfg.RemoteControl = func(command airplay.RemoteCommand) {
+		m.emit(event{kind: "remote", id: id, generation: generation, playerGeneration: playerGeneration, remote: command})
+	}
 	var output Output
 	var err error
 	cb := func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) }
 	if _, _, staged := target.HomeTheater(); staged {
-		output, err = m.cfg.OpenGroupOutput(child, m.airplayConfig(), target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
+		output, err = m.cfg.OpenGroupOutput(child, cfg, target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
 	} else {
-		output, err = m.cfg.OpenOutput(child, m.airplayConfig(), target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
+		output, err = m.cfg.OpenOutput(child, cfg, target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
 	}
 	if !m.requestCurrent(q) {
 		if output != nil {
@@ -1181,6 +1222,24 @@ func (m *Manager) Playback(ctx context.Context, action string, value int64) erro
 	}
 	m.op.Lock()
 	defer m.op.Unlock()
+	if action != "volume" {
+		m.remoteBarrier = time.Now() // queued receiver controls cannot undo newer UI intent
+	}
+	if action == "pause" || action == "stop" {
+		m.mu.Lock()
+		r := m.accounts[m.playback.AccountID]
+		current := m.playback.AccountID == requestedID && r != nil && r.generation == requestedGeneration
+		m.mu.Unlock()
+		if !current {
+			return errPlaybackSuperseded
+		}
+		m.diagnostic("播放控制：网页请求暂停")
+	}
+	return m.playbackCommand(ctx, action, value)
+}
+
+// Caller holds op; receiver controls and the management API share this path.
+func (m *Manager) playbackCommand(ctx context.Context, action string, value int64) error {
 	if action == "pause" || action == "stop" {
 		m.cancelOutputRecovery()
 	}
@@ -1202,15 +1261,21 @@ func (m *Manager) Playback(ctx context.Context, action string, value int64) erro
 		return errors.New("请先在 Spotify 中选择此设备并播放")
 	}
 	if action == "pause" || action == "stop" {
-		if m.playback.AccountID != requestedID || r.generation != requestedGeneration {
-			return errPlaybackSuperseded
-		}
-		m.diagnostic("播放控制：网页请求暂停")
+		// Remote controls invalidate recovery here; web requests also interrupt
+		// at the API boundary before waiting for the lifecycle lock.
+		m.interruptPlayback("", true)
 		err := r.player.Command(ctx, "pause", nil)
+		r.pauseUnconfirmed = err != nil
 		outputErr := m.pauseOutput(ctx, action == "stop" || err != nil)
+		if err != nil {
+			m.setPlayback(func(v *model.Playback) {
+				v.Error = "暂停控制失败，音频输出已断开；请通过 Spotify 重试"
+			})
+		}
 		return errors.Join(err, outputErr)
 	}
 	if action == "resume" {
+		r.pauseUnconfirmed = false
 		m.mu.Lock()
 		r.intent.revision++
 		r.intent.wantPlay = true
@@ -1229,39 +1294,19 @@ func (m *Manager) StartPairing(deviceID string) (model.PairingView, error) {
 func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingView, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
+	target, d, err := m.authenticationMember(deviceID, memberID)
+	if err != nil {
+		return model.PairingView{}, err
+	}
+	switch airplay.Authentication(d, m.store.Snapshot().Pairings[d.ID]).Requirement {
+	case "password":
+		return model.PairingView{}, errors.New("此设备要求 AirPlay 密码，请保存设备密码后尝试播放，无需输入四位配对码")
+	case "access_control":
+		return model.PairingView{}, errors.New("设备限制了家庭访问权限，请先在家庭 App 或设备上检查 AirPlay 访问设置")
+	}
 	m.mu.Lock()
-	target, exists := airplay.ResolveTarget(m.devices, deviceID, time.Now())
 	busy := m.pairingView != nil && (m.pairingView.Status == "starting" || m.pairingView.Status == "waiting_pin" || m.pairingView.Status == "verifying")
 	m.mu.Unlock()
-	if !exists {
-		return model.PairingView{}, errors.New("设备不存在")
-	}
-	d := target.Device
-	if pod, _, staged := target.HomeTheater(); staged {
-		d = pod
-		if memberID != "" {
-			found := false
-			for _, member := range target.Members {
-				if member.ID == memberID {
-					d = member
-					found = true
-				}
-			}
-			if !found {
-				return model.PairingView{}, errors.New("配对成员不属于所选组合")
-			}
-		}
-		if !d.Online {
-			return model.PairingView{}, errors.New("配对成员尚未上线")
-		}
-	} else {
-		if memberID != "" && memberID != d.ID {
-			return model.PairingView{}, errors.New("此目标不支持独立成员配对")
-		}
-		if err := target.Ready(); err != nil {
-			return model.PairingView{}, err
-		}
-	}
 	deviceID = d.ID
 	if busy {
 		return model.PairingView{}, errors.New("已有配对正在进行")
@@ -1290,7 +1335,9 @@ func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingVi
 		}
 		if err == nil {
 			err = m.store.Update(func(s *store.State) error {
-				s.Pairings[deviceID] = model.PairingSecret{DACP: dacp, Credentials: credentials}
+				secret := s.Pairings[deviceID]
+				secret.DACP, secret.Credentials = dacp, credentials
+				s.Pairings[deviceID] = secret
 				for _, member := range target.Members {
 					s.Devices[member.ID] = member
 				}
@@ -1301,7 +1348,7 @@ func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingVi
 		if m.pairingView != nil && m.pairingView.ID == v.ID && m.pairingView.Status != "cancelled" {
 			if err != nil {
 				m.pairingView.Status = "error"
-				m.pairingView.Error = "配对失败，请检查配对码和设备连接"
+				m.pairingView.Error = "配对失败：请确认该成员支持屏幕 PIN，检查配对码、AirPlay 访问设置及网络；可直接播放的设备无需额外配对"
 			} else {
 				m.pairingView.Status = "paired"
 			}

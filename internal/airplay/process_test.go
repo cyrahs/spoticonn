@@ -3,6 +3,8 @@ package airplay
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -187,6 +189,14 @@ func TestAirPlayEngineProcess(t *testing.T) {
 	if os.Getenv("SPOTICONN_TEST_AIRPLAY") != "1" {
 		return
 	}
+	if path := os.Getenv("SPOTICONN_TEST_AIRPLAY_ARGS"); path != "" {
+		_ = os.WriteFile(path, []byte(strings.Join(os.Args, "\n")), 0600)
+	}
+	if code := os.Getenv("SPOTICONN_TEST_AIRPLAY_ERROR"); code != "" {
+		fmt.Printf("[STATUS] error code=%s http=401 detail=\"secret-from-engine\"\n", code)
+		fmt.Println("[STATUS] error: generic failure")
+		os.Exit(1)
+	}
 	var pipe string
 	pair := false
 	for i, v := range os.Args {
@@ -239,8 +249,15 @@ func TestAirPlayEngineProcess(t *testing.T) {
 	}()
 	sc := bufio.NewScanner(f)
 	var requested int64
+	var artworkFile, item string
 	join := false
 	for sc.Scan() {
+		if value, ok := strings.CutPrefix(sc.Text(), "ARTWORKFILE="); ok {
+			artworkFile = value
+		}
+		if value, ok := strings.CutPrefix(sc.Text(), "ITEMID="); ok {
+			item = value
+		}
 		if value, ok := strings.CutPrefix(sc.Text(), "START_UNIX_MS="); ok {
 			requested, _ = strconv.ParseInt(value, 10, 64)
 		}
@@ -248,6 +265,19 @@ func TestAirPlayEngineProcess(t *testing.T) {
 			fmt.Fprintln(commandLog, sc.Text())
 		}
 		switch sc.Text() {
+		case "ACTION=SENDMETA":
+			if event := os.Getenv("SPOTICONN_TEST_AIRPLAY_REMOTE"); event != "" {
+				fmt.Fprintln(os.Stdout, event)
+			}
+			if artworkFile != "" && commandLog != nil {
+				data, err := os.ReadFile(artworkFile)
+				if err != nil {
+					fmt.Fprintln(commandLog, "ARTWORK_LOAD_FAILED")
+				} else {
+					fmt.Fprintf(commandLog, "ARTWORK_LOADED item=%s sha256=%x\n", item, sha256.Sum256(data))
+				}
+			}
+			artworkFile = ""
 		case "START_JOIN=1":
 			join = true
 		case "ACTION=START":
@@ -324,5 +354,49 @@ func TestMalformedAndUnsolicitedStartsCannotConfirmPlayback(t *testing.T) {
 	s.scan(strings.NewReader("[STATUS] started at_unix_ms=123\n"))
 	if s.anchor != 0 {
 		t.Fatal("unsolicited anchor accepted")
+	}
+}
+
+func TestSenderPassesPasswordWithoutLosingPairedIdentity(t *testing.T) {
+	binary := fakeBinary(t)
+	argsPath := filepath.Join(t.TempDir(), "args")
+	t.Setenv("SPOTICONN_TEST_AIRPLAY_ARGS", argsPath)
+	secret := model.PairingSecret{DACP: "saved-id", Credentials: strings.Repeat("b", 192), Password: "sp ace;$literal"}
+	s, err := Open(t.Context(), Config{Binary: binary, RuntimeDir: t.TempDir()}, model.Device{Address: "127.0.0.1", Port: 7000, TXT: map[string]string{"sf": "80"}}, secret, 30, 44100, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--password\n" + secret.Password, "--auth\n" + secret.Credentials, "--dacp\n" + secret.DACP, "--pw\ntrue"} {
+		if !strings.Contains(string(args), want) {
+			t.Fatal("missing literal authentication argument")
+		}
+	}
+}
+
+func TestSenderReturnsSafeAuthenticationErrors(t *testing.T) {
+	for code, want := range map[string]error{"auth_required": ErrAuthRequired, "auth_failed": ErrAuthFailed, "connect_failed": nil} {
+		t.Run(code, func(t *testing.T) {
+			binary := fakeBinary(t)
+			t.Setenv("SPOTICONN_TEST_AIRPLAY_ERROR", code)
+			s, err := Open(t.Context(), Config{Binary: binary, RuntimeDir: t.TempDir()}, model.Device{Address: "127.0.0.1", Port: 7000}, model.PairingSecret{}, 30, 44100, func(string) {})
+			if err == nil {
+				s.Close()
+				t.Fatal("authentication failure accepted")
+			}
+			if strings.Contains(err.Error(), "secret-from-engine") {
+				t.Fatal("engine detail leaked")
+			}
+			if want != nil && !errors.Is(err, want) {
+				t.Fatalf("got %v, want %v", err, want)
+			}
+			if want == nil && (errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrAuthFailed)) {
+				t.Fatal("network failure mislabeled as authentication")
+			}
+		})
 	}
 }

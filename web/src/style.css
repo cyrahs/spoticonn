@@ -836,6 +836,18 @@ nav {
   line-height: 1.6;
   color: #a2b89f;
 }
+.remote-control-help {
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.remote-control-help summary {
+  cursor: pointer;
+}
+.remote-control-help p {
+  margin: 8px 0 0;
+}
 .group-playback-status {
   margin: 12px 0 0;
   font-size: 12px;
@@ -882,6 +894,27 @@ nav {
   font-size: 9px;
   color: #a5bf9f;
   margin: 0 0 12px 66px;
+}
+.device-auth {
+  margin: 12px 14px;
+  padding-top: 10px;
+  border-top: 1px solid #3c4d40;
+  color: #a2b89f;
+  font-size: 10px;
+  line-height: 1.6;
+}
+.device-auth strong {
+  font-weight: 500;
+}
+.device-auth p {
+  margin: 6px 0;
+}
+.device-auth .pair-button {
+  margin: 8px 0;
+  text-align: left;
+}
+.device-auth summary {
+  cursor: pointer;
 }
 .output-note {
   display: flex;

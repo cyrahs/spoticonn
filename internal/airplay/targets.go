@@ -66,13 +66,15 @@ func (t Target) View(pairings map[string]model.PairingSecret) model.DeviceView {
 	v := model.DeviceView{Device: t.Device, Group: t.Group, WaitingForLeader: t.Ready() != nil}
 	v.Name = t.Name
 	v.TXT = nil
-	_, v.Paired = pairings[t.Device.ID]
+	v.Paired = pairings[t.Device.ID].Credentials != ""
+	v.Authentication = Authentication(t.Device, pairings[t.Device.ID])
 	pod, tv, staged := t.HomeTheater()
 	if staged {
 		v.Staged = true
 		v.AudioDeviceID, v.JoinDeviceID = pod.ID, tv.ID
 		v.Online = pod.Online
-		_, v.Paired = pairings[pod.ID]
+		v.Paired = pairings[pod.ID].Credentials != ""
+		v.Authentication = Authentication(pod, pairings[pod.ID])
 		v.WaitingForLeader = false
 	}
 	if t.Group {
@@ -80,8 +82,7 @@ func (t Target) View(pairings map[string]model.PairingSecret) model.DeviceView {
 			v.Paired = v.Paired && t.LeaderID != ""
 		}
 		for _, d := range t.Members {
-			_, paired := pairings[d.ID]
-			v.Members = append(v.Members, model.DeviceMember{ID: d.ID, Name: displayName(d.Name), Model: d.Model, Online: d.Online, Paired: paired})
+			v.Members = append(v.Members, model.DeviceMember{ID: d.ID, Name: displayName(d.Name), Model: d.Model, Online: d.Online, Paired: pairings[d.ID].Credentials != "", Authentication: Authentication(d, pairings[d.ID])})
 		}
 	}
 	return v

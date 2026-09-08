@@ -87,6 +87,17 @@ func New(m *bridge.Manager, passwordHash string, secure bool, files fs.FS) (http
 		}
 		write(w, 201, p)
 	})))
+	mux.Handle("POST /api/airplay/passwords", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			DeviceID string `json:"device_id"`
+			MemberID string `json:"member_id"`
+			Password string `json:"password"`
+		}
+		if !decode(w, r, &b) {
+			return
+		}
+		respond(w, m.SaveDevicePassword(b.DeviceID, b.MemberID, b.Password))
+	})))
 	mux.Handle("POST /api/airplay/pairings/{id}/pin", s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var b struct {
 			PIN string `json:"pin"`
