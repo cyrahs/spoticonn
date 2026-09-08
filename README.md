@@ -104,7 +104,7 @@ export SPOTICONN_ADMIN_PASSWORD='替换为至少12字节的管理密码'
 - Spotify iOS App 的 Connect 控制与 iOS 控制中心“控制其他扬声器与电视”是不同能力。已接入 cliairplay 的 MediaRemote 播放控制事件：接收端的暂停请求会暂停当前 Spotify 音源并清空输出缓冲；两成员共享去重，旧输出／已取消成员的请求会被丢弃。当前没有 DACP HTTP 回调服务，不能保证所有接收端路径可用，也不能以显示曲目信息推断控制可用。
 - iOS 实机控制尚待验收。分阶段组合暂停时会关闭 Apple TV 加入会话，原生恢复可能不可用，请从 Spotify 或管理网页恢复；原生恢复、切歌和音量须独立验收。具体入口、协议边界与验证步骤见 [issue #8 控制验收](docs/ISSUE_8_VALIDATION.md)，出声验收见 [组合验收记录](docs/ISSUE_5_VALIDATION.md)。
 - 专辑封面在后台下载并缓存，Apple TV 晚加入、切歌及重连时发送当前封面；下载失败不阻断音频或文本元数据。支持公网 HTTPS 的 JPEG/PNG，Apple MediaRemote 使用 JPEG；接口限制和实机检查见 [封面验收说明](docs/ISSUE_7_VALIDATION.md)。
-- Spotify 子进程失败后退避重启；AirPlay 出错时先暂停 Spotify，再以退避方式重连并恢复当前请求。网页主动暂停会取消输出自动恢复。
+- Spotify 子进程失败后退避重启；AirPlay 出错时先暂停 Spotify，确认内部暂停后才以退避方式重连。Spotify App 或网页主动暂停会使旧恢复操作失效；清缓冲失败、断线和组合成员晚加入都不能重新启动播放。内部暂停未收到确认时保持暂停，需手动恢复。命令序列回归与实机步骤见 [暂停恢复验收说明](docs/ISSUE_12_VALIDATION.md)。
 - 服务重启后恢复账号在线状态，不主动开始播放。设备离线不使管理服务健康检查失败。
 
 ## 管理 API

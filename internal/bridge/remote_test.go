@@ -21,6 +21,7 @@ func captureRemote(t *testing.T, m *Manager) func(airplay.RemoteCommand) {
 		return open(ctx, cfg, d, pair, vol, rate, cb)
 	}
 	m.handle(playing("a", 1))
+	drainEvents(m) // consume the internal startup pause acknowledgement
 	if callback == nil {
 		t.Fatal("output was not given a remote callback")
 	}
@@ -269,4 +270,27 @@ func TestPolledPauseStillClearsUnparkedAudio(t *testing.T) {
 	if (*outputs)[0].data != "" || (*outputs)[0].flushes != 1 || a.forward != nil {
 		t.Fatal("polling a paused status incorrectly skipped audio cleanup")
 	}
+}
+
+func TestRemotePauseInvalidatesRecoveryWithoutSpotifyAcknowledgement(t *testing.T) {
+	m, a, _, outputs := setup(t)
+	cb := captureRemote(t, m)
+	q := m.playbackRequest("a")
+	a.onCommand = nil // remote pause must work even if the websocket event is lost
+	a.commands = nil
+	at := time.Now()
+	dispatchRemote(m, cb, context.Background(), "tv", "pause", at)
+	if m.requestCurrent(q) || m.wantsPlayback("a") {
+		t.Fatal("remote pause left the previous playback request eligible for recovery")
+	}
+	assertPaused(t, m, a)
+	assertCommands(t, a, "pause")
+	// A later explicit remote resume restores fresh intent and the parked path.
+	dispatchRemote(m, cb, context.Background(), "tv", "play", at.Add(time.Second))
+	m.handle(playing("a", 1))
+	a.write("resumed")
+	if !m.wantsPlayback("a") || m.outputParked || (*outputs)[0].data != "resumed" {
+		t.Fatal("remote resume did not restore fresh playback intent and audio")
+	}
+	assertCommands(t, a, "pause", "resume")
 }

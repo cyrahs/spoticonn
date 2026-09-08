@@ -37,6 +37,7 @@ type Config struct {
 }
 type runtimeAccount struct {
 	player            Player
+	intent            playbackIntent
 	generation        uint64
 	status, errorText string
 	retryAt           time.Time
@@ -48,12 +49,14 @@ type runtimeAccount struct {
 	login             *spotify.Login
 }
 type event struct {
-	kind, id         string
-	generation       uint64
-	spotify          spotify.Event
-	status           string
-	remote           airplay.RemoteCommand
-	playerGeneration uint64
+	kind, id                string
+	generation              uint64
+	spotify                 spotify.Event
+	status                  string
+	observed, internalPause bool
+	intent                  uint64
+	remote                  airplay.RemoteCommand
+	playerGeneration        uint64
 }
 type Manager struct {
 	mu                                 sync.Mutex // snapshots and runtime fields
@@ -69,8 +72,10 @@ type Manager struct {
 	outputRate                         int
 	outputParked                       bool
 	outputGeneration                   uint64
+	outputCancel                       context.CancelFunc
 	outputRetryAt                      time.Time
 	outputRetryAccount                 string
+	outputRetryRequest                 playbackRequest
 	outputFailures                     int
 	remoteLast                         map[string]time.Time
 	remoteBarrier                      time.Time
@@ -120,6 +125,7 @@ func (m *Manager) emit(e event) {
 	if m.ctx.Err() != nil {
 		return
 	}
+	e = m.observePlaybackEvent(e)
 	// Engine callbacks must never wait for the lifecycle lock: closing a
 	// process waits for its output readers. Coalesce repeated notifications,
 	// keeping their latest order; playback events are checked against live state.
@@ -131,7 +137,7 @@ func (m *Manager) emit(e event) {
 	for i := len(m.events) - 1; i >= 0; i-- {
 		old := m.events[i]
 		if old.kind == e.kind && old.id == e.id && (old.generation < e.generation ||
-			(old.generation == e.generation && old.spotify.Type == e.spotify.Type && old.status == e.status && old.remote.Action == e.remote.Action && old.remote.DeviceID == e.remote.DeviceID)) {
+			(old.generation == e.generation && old.spotify.Type == e.spotify.Type && old.status == e.status && old.internalPause == e.internalPause && old.remote.Action == e.remote.Action && old.remote.DeviceID == e.remote.DeviceID)) {
 			m.events = append(m.events[:i], m.events[i+1:]...)
 		}
 	}
@@ -315,6 +321,7 @@ func (m *Manager) start(a model.Account) {
 		return
 	}
 	r.generation++
+	r.intent = playbackIntent{}
 	generation := r.generation
 	r.status = "starting"
 	r.errorText = ""
@@ -438,14 +445,15 @@ func (m *Manager) reconcile() {
 		r := m.accounts[m.outputRetryAccount]
 		current := m.playback.AccountID == m.outputRetryAccount
 		m.mu.Unlock()
-		if !current {
+		if !current || !m.requestCurrent(m.outputRetryRequest) {
 			m.cancelOutputRecovery()
 		} else if r != nil && r.player != nil {
+			m.diagnostic(fmt.Sprintf("播放控制：触发输出恢复，操作=%d，会话=%d", m.outputRetryRequest.intent, m.outputRetryRequest.generation))
 			ctx, cancel := context.WithTimeout(m.ctx, 2*time.Second)
 			status, err := r.player.Status(ctx)
 			cancel()
 			if err == nil && !status.Stopped && status.Track != nil {
-				if err = m.acquire(m.outputRetryAccount, status); err != nil {
+				if err = m.acquire(m.outputRetryAccount, status); err != nil && !errors.Is(err, errPlaybackSuperseded) {
 					m.failOutput(err.Error())
 				} else {
 					m.cancelOutputRecovery()
@@ -516,6 +524,7 @@ func (m *Manager) stopAccount(id string) {
 		return
 	}
 	r.generation++
+	invalidateIntent(r, true)
 	p := r.player
 	r.player = nil
 	current := m.playback.AccountID == id
@@ -546,6 +555,12 @@ func (m *Manager) handle(e event) {
 			return
 		}
 		if strings.HasPrefix(e.status, "group_") {
+			m.mu.Lock()
+			id := m.playback.AccountID
+			m.mu.Unlock()
+			if e.status != "group_waiting" && !m.wantsPlayback(id) {
+				return
+			}
 			m.setPlayback(func(p *model.Playback) {
 				p.GroupStatus = e.status
 				p.GroupReason = groupReason(e.status)
@@ -555,7 +570,7 @@ func (m *Manager) handle(e event) {
 		switch e.status {
 		case "playing":
 			m.setPlayback(func(p *model.Playback) {
-				if p.Status != "paused" {
+				if p.Status != "paused" && m.accounts[p.AccountID] != nil && m.accounts[p.AccountID].intent.wantPlay {
 					p.Status = "playing"
 					p.OutputStatus = "playing"
 					p.Error = ""
@@ -605,6 +620,11 @@ func (m *Manager) handle(e event) {
 	if p == nil {
 		return
 	}
+	// Internal pause acknowledgements need no output work.
+	e = m.observePlaybackEvent(e)
+	if e.internalPause {
+		return
+	}
 	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
 	defer cancel()
 	switch e.spotify.Type {
@@ -617,43 +637,38 @@ func (m *Manager) handle(e event) {
 			return
 		} // stale events must never take over
 		m.mu.Lock()
+		if e.intent != r.intent.revision {
+			m.mu.Unlock()
+			return
+		}
+		r.intent.wantPlay = true
+		r.intent.internalPaused = false
 		r.last = status
 		m.mu.Unlock()
-		if err = m.acquire(e.id, status); err != nil {
+		if err = m.acquire(e.id, status); err != nil && !errors.Is(err, errPlaybackSuperseded) {
 			m.failOutput(err.Error())
 		}
 	case "paused", "inactive", "stopped", "not_playing":
 		m.mu.Lock()
-		current := m.playback.AccountID == e.id
+		current := m.playback.AccountID == e.id && e.intent == r.intent.revision
 		m.mu.Unlock()
 		if current {
 			// Our own pause/seek/resume sequence can enqueue a pause event that
 			// arrives after resume. Reconcile it with the live player first.
-			live, statusErr := p.Status(ctx)
-			if statusErr == nil && !live.Paused && !live.Stopped && e.spotify.Type != "inactive" {
+			live, err := p.Status(ctx)
+			m.diagnostic(fmt.Sprintf("播放控制：Spotify %s，状态可用=%t paused=%t stopped=%t，操作=%d，会话=%d", e.spotify.Type, err == nil, live.Paused, live.Stopped, e.intent, e.generation))
+			if err == nil && !live.Paused && !live.Stopped && e.spotify.Type != "inactive" {
+				m.mu.Lock()
+				if e.intent == r.intent.revision {
+					r.intent.wantPlay = true
+				}
+				m.mu.Unlock()
 				return
 			}
-			if statusErr == nil && (live.Paused || live.Stopped) {
+			if err == nil && (live.Paused || live.Stopped) {
 				r.pauseUnconfirmed = false
 			}
-			if m.outputParked && (e.spotify.Type == "paused" || e.spotify.Type == "not_playing") {
-				return // the synchronous pause path already cleared and parked audio
-			}
-			m.detach()
-			if m.output != nil {
-				if err := m.output.Flush(ctx); err != nil {
-					m.failOutput(err.Error())
-					return
-				}
-				_ = m.output.Standby()
-				m.outputParked = true
-			}
-			if e.spotify.Type == "inactive" || e.spotify.Type == "stopped" {
-				m.cancelOutputRecovery()
-				m.closeOutput()
-				m.setPlayback(func(v *model.Playback) { v.OutputStatus = "disconnected" })
-			}
-			m.setPlayback(func(v *model.Playback) { v.Status = "paused" })
+			_ = m.pauseOutput(ctx, e.spotify.Type == "inactive" || e.spotify.Type == "stopped")
 		}
 	case "will_play", "seek":
 		m.mu.Lock()
@@ -733,6 +748,10 @@ func (m *Manager) detach() {
 }
 func (m *Manager) closeOutput() {
 	m.outputGeneration++
+	if m.outputCancel != nil {
+		m.outputCancel()
+		m.outputCancel = nil
+	}
 	m.outputParked = false
 	m.remoteLast = nil
 	if m.output != nil {
@@ -743,6 +762,10 @@ func (m *Manager) closeOutput() {
 }
 
 func (m *Manager) acquire(id string, status model.PlayerStatus) error {
+	q := m.playbackRequest(id)
+	if !m.requestCurrent(q) {
+		return errPlaybackSuperseded
+	}
 	m.mu.Lock()
 	old := m.playback.AccountID
 	r := m.accounts[id]
@@ -764,9 +787,25 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		_ = r.player.Command(m.ctx, "pause", nil)
 		return errors.New("当前音频采样率不受支持")
 	}
-	ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
+	child, closeChild := context.WithCancel(m.ctx)
+	ctx, cancel := context.WithTimeout(child, 20*time.Second)
 	defer cancel()
+	m.mu.Lock()
+	r.intent.cancel = closeChild
+	m.mu.Unlock()
+	connected := false
+	defer func() {
+		m.mu.Lock()
+		r.intent.cancel = nil
+		m.mu.Unlock()
+		if !connected {
+			closeChild()
+		}
+	}()
 	if old == id && m.output != nil && m.outputRate == rate {
+		if !m.requestCurrent(q) {
+			return errPlaybackSuperseded
+		}
 		m.outputParked = false
 		m.output.Begin()
 		r.player.Route(rate, m.output.Write)
@@ -787,10 +826,6 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	}
 	// Freeze the new account while AirPlay connects, then rewind to its request
 	// position so draining startup PCM cannot skip the beginning of a song.
-	if err := r.player.Command(ctx, "pause", nil); err != nil {
-		return err
-	}
-	r.player.Drain()
 	m.closeOutput()
 	m.setPlayback(func(v *model.Playback) {
 		v.AccountID = id
@@ -799,6 +834,14 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		v.Error = ""
 		v.Track = status.Track
 	})
+	if err := m.pauseForOutput(ctx, q, "连接输出"); err != nil {
+		if errors.Is(err, errPlaybackSuperseded) {
+			m.cancelOutputRecovery()
+			m.setPlayback(func(v *model.Playback) { v.Status = "paused"; v.OutputStatus = "disconnected" })
+		}
+		return err
+	}
+	r.player.Drain()
 	generation := m.outputGeneration
 	playerGeneration := r.generation
 	cfg := m.airplayConfig()
@@ -809,14 +852,25 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	var err error
 	cb := func(s string) { m.emit(event{kind: "output", generation: generation, status: s}) }
 	if _, _, staged := target.HomeTheater(); staged {
-		output, err = m.cfg.OpenGroupOutput(m.ctx, cfg, target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
+		output, err = m.cfg.OpenGroupOutput(child, cfg, target, state.Pairings, state.Settings.Volume, rate, cb, m.diagnostic)
 	} else {
-		output, err = m.cfg.OpenOutput(m.ctx, cfg, target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
+		output, err = m.cfg.OpenOutput(child, cfg, target.Device, state.Pairings[target.Device.ID], state.Settings.Volume, rate, cb)
+	}
+	if !m.requestCurrent(q) {
+		if output != nil {
+			output.Close()
+		}
+		m.closeOutput()
+		m.cancelOutputRecovery()
+		m.setPlayback(func(v *model.Playback) { v.Status = "paused"; v.OutputStatus = "disconnected" })
+		m.diagnostic("播放控制：输出连接已失效，取消内部恢复")
+		return errPlaybackSuperseded
 	}
 	if err != nil {
 		return err
 	}
 	m.output = output
+	m.outputCancel = closeChild
 	m.outputRate = rate
 	m.cancelOutputRecovery()
 	if err = r.player.Command(ctx, "volume", map[string]any{"volume": state.Settings.Volume}); err != nil {
@@ -829,46 +883,81 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 			return err
 		}
 	}
+	// Recheck after all potentially blocking setup commands. A callback or
+	// web pause can invalidate q while the lifecycle lock is still held.
+	live, err := r.player.Status(ctx)
+	if err != nil || live.Stopped || !m.requestCurrent(q) {
+		m.closeOutput()
+		m.cancelOutputRecovery()
+		if err != nil {
+			return err
+		}
+		m.setPlayback(func(v *model.Playback) { v.Status = "paused"; v.OutputStatus = "disconnected" })
+		return errPlaybackSuperseded
+	}
 	r.player.Drain()
 	output.Begin()
 	_ = output.Metadata(status.Track)
 	r.player.Route(rate, output.Write)
+	if !m.requestCurrent(q) {
+		m.detach()
+		m.closeOutput()
+		return errPlaybackSuperseded
+	}
+	m.diagnostic(fmt.Sprintf("播放控制：内部 resume，来源=连接输出，操作=%d，会话=%d", q.intent, q.generation))
 	if err = r.player.Command(ctx, "resume", nil); err != nil {
 		m.detach()
 		m.closeOutput()
 		return err
 	}
+	if !m.requestCurrent(q) {
+		m.detach()
+		m.closeOutput()
+		m.setPlayback(func(v *model.Playback) { v.Status = "paused"; v.OutputStatus = "disconnected" })
+		return errPlaybackSuperseded
+	}
+	m.mu.Lock()
+	r.intent.internalPaused = false
+	m.mu.Unlock()
+	connected = true
 	m.setPlayback(func(v *model.Playback) { v.Status = "buffering"; v.OutputStatus = "connected" })
 	return nil
 }
 
 func (m *Manager) failOutput(message string) {
-	m.mu.Lock()
-	shouldRecover := m.playback.Status != "paused" || m.playback.Recovering
-	m.mu.Unlock()
 	m.detach()
 	m.closeOutput()
 	m.mu.Lock()
 	r := m.accounts[m.playback.AccountID]
 	id := m.playback.AccountID
 	m.mu.Unlock()
-	if r != nil && r.player != nil {
+	q := m.playbackRequest(id)
+	if r != nil && r.player != nil && m.requestCurrent(q) {
 		ctx, cancel := context.WithTimeout(m.ctx, 3*time.Second)
-		_ = r.player.Command(ctx, "pause", nil)
+		if err := m.pauseForOutput(ctx, q, "故障恢复"); err != nil {
+			m.interruptPlayback(id, true)
+		}
 		cancel()
 	}
 	m.setPlayback(func(p *model.Playback) { p.Status = "paused"; p.OutputStatus = "error"; p.Error = message })
-	if shouldRecover && id != "" && m.store.Snapshot().Settings.TargetID != "" {
+	m.cancelOutputRecovery()
+	if id != "" && m.requestCurrent(q) && m.store.Snapshot().Settings.TargetID != "" {
 		m.outputFailures++
 		m.outputRetryAccount = id
+		m.outputRetryRequest = q
 		m.outputRetryAt = time.Now().Add(time.Duration(min(60, 1<<min(m.outputFailures, 6))) * time.Second)
 		m.setPlayback(func(p *model.Playback) { p.Recovering = true })
+		m.diagnostic(fmt.Sprintf("播放控制：安排输出恢复，操作=%d，会话=%d，失败次数=%d", q.intent, q.generation, m.outputFailures))
 	}
 	m.diagnostic(message)
 }
 
 func (m *Manager) cancelOutputRecovery() {
+	if m.outputRetryAccount != "" {
+		m.diagnostic("播放控制：取消输出恢复")
+	}
 	m.outputRetryAccount = ""
+	m.outputRetryRequest = playbackRequest{}
 	m.setPlayback(func(p *model.Playback) { p.Recovering = false })
 }
 
@@ -894,6 +983,7 @@ func (m *Manager) AddAccount(label string) (model.Account, error) {
 	return a, nil
 }
 func (m *Manager) DeleteAccount(id string) error {
+	m.interruptPlayback(id, true)
 	m.op.Lock()
 	defer m.op.Unlock()
 	exists := false
@@ -927,6 +1017,7 @@ func (m *Manager) DeleteAccount(id string) error {
 	return nil
 }
 func (m *Manager) Rebind(id string) error {
+	m.interruptPlayback(id, true)
 	m.op.Lock()
 	defer m.op.Unlock()
 	state := m.store.Snapshot()
@@ -974,8 +1065,6 @@ func (m *Manager) Rebind(id string) error {
 }
 
 func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
-	m.op.Lock()
-	defer m.op.Unlock()
 	s.Name = strings.TrimSpace(s.Name)
 	if s.Name == "" || len([]rune(s.Name)) > 60 || strings.ContainsAny(s.Name, "\r\n") {
 		return errors.New("播放器名称需为 1–60 个字符")
@@ -983,6 +1072,30 @@ func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
 	if s.Volume < 0 || s.Volume > 100 {
 		return errors.New("音量范围为 0–100")
 	}
+	// Validate before interrupting an in-flight connection. Revalidate after
+	// acquiring op because discovery/settings can change while we wait.
+	before := m.store.Snapshot().Settings
+	m.mu.Lock()
+	next, nextExists := airplay.ResolveTarget(m.devices, s.TargetID, time.Now())
+	prior, priorExists := airplay.ResolveTarget(m.devices, before.TargetID, time.Now())
+	m.mu.Unlock()
+	if s.TargetID != "" && !nextExists {
+		return errors.New("输出设备不存在")
+	}
+	changedTarget := before.TargetID != s.TargetID
+	if nextExists && priorExists && next.Device.ID == prior.Device.ID {
+		changedTarget = false
+	}
+	if changedTarget && nextExists {
+		if err := next.Ready(); err != nil {
+			return err
+		}
+	}
+	if changedTarget || before.Name != s.Name {
+		m.interruptPlayback("", false)
+	}
+	m.op.Lock()
+	defer m.op.Unlock()
 	old := m.store.Snapshot().Settings
 	m.mu.Lock()
 	target, exists := airplay.ResolveTarget(m.devices, s.TargetID, time.Now())
@@ -1017,12 +1130,25 @@ func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
 		m.mu.Unlock()
 		if r != nil && r.player != nil {
 			v, err := r.player.Status(ctx)
-			if err == nil && !v.Paused && !v.Stopped {
+			m.mu.Lock()
+			internal := r.intent.internalPaused
+			m.mu.Unlock()
+			if err == nil && (!v.Paused || internal) && !v.Stopped && m.wantsPlayback(active) {
 				resume = &v
 			}
 			m.detach()
-			if err := r.player.Command(ctx, "pause", nil); err != nil {
-				return err
+			if resume != nil {
+				if err := m.pauseForOutput(ctx, m.playbackRequest(active), "切换目标"); err != nil {
+					if !errors.Is(err, errPlaybackSuperseded) {
+						return err
+					}
+					resume = nil
+				}
+			} else {
+				m.interruptPlayback(active, true)
+				if err := r.player.Command(ctx, "pause", nil); err != nil {
+					return err
+				}
 			}
 		}
 		m.closeOutput()
@@ -1055,7 +1181,7 @@ func (m *Manager) UpdateSettings(ctx context.Context, s model.Settings) error {
 		return err
 	}
 	if resume != nil && s.TargetID != "" {
-		if err := m.acquire(active, *resume); err != nil {
+		if err := m.acquire(active, *resume); err != nil && !errors.Is(err, errPlaybackSuperseded) {
 			m.failOutput(err.Error())
 			return err
 		}
@@ -1089,10 +1215,25 @@ func (m *Manager) setVolume(ctx context.Context, v int, spotifyToo bool) error {
 	return nil
 }
 func (m *Manager) Playback(ctx context.Context, action string, value int64) error {
+	var requestedID string
+	var requestedGeneration uint64
+	if action == "pause" || action == "stop" {
+		requestedID, requestedGeneration = m.interruptPlayback("", true)
+	}
 	m.op.Lock()
 	defer m.op.Unlock()
 	if action != "volume" {
 		m.remoteBarrier = time.Now() // queued receiver controls cannot undo newer UI intent
+	}
+	if action == "pause" || action == "stop" {
+		m.mu.Lock()
+		r := m.accounts[m.playback.AccountID]
+		current := m.playback.AccountID == requestedID && r != nil && r.generation == requestedGeneration
+		m.mu.Unlock()
+		if !current {
+			return errPlaybackSuperseded
+		}
+		m.diagnostic("播放控制：网页请求暂停")
 	}
 	return m.playbackCommand(ctx, action, value)
 }
@@ -1108,7 +1249,7 @@ func (m *Manager) playbackCommand(ctx context.Context, action string, value int6
 	if action == "seek" && value < 0 {
 		return errors.New("播放位置不可为负数")
 	}
-	if action == "pause" || action == "stop" || action == "seek" || action == "next" || action == "prev" {
+	if action == "seek" || action == "next" || action == "prev" {
 		if group, ok := m.output.(interface{ CancelJoin() }); ok {
 			group.CancelJoin()
 		}
@@ -1119,40 +1260,26 @@ func (m *Manager) playbackCommand(ctx context.Context, action string, value int6
 	if r == nil || r.player == nil {
 		return errors.New("请先在 Spotify 中选择此设备并播放")
 	}
-	if action == "resume" {
-		r.pauseUnconfirmed = false
-	}
 	if action == "pause" || action == "stop" {
-		// Stop the source and queued PCM immediately. Do not wait for a Spotify
-		// websocket event, which can be delayed or absent after a remote pause.
+		// Remote controls invalidate recovery here; web requests also interrupt
+		// at the API boundary before waiting for the lifecycle lock.
+		m.interruptPlayback("", true)
 		err := r.player.Command(ctx, "pause", nil)
 		r.pauseUnconfirmed = err != nil
-		m.detach()
-		r.player.Drain()
-		if action == "stop" || err != nil {
-			m.closeOutput()
-		} else if m.output != nil {
-			err = m.output.Flush(ctx)
-			if err == nil {
-				err = m.output.Standby()
-			}
-			if err != nil {
-				m.closeOutput()
-			} else {
-				m.outputParked = true
-			}
-		}
-		m.setPlayback(func(v *model.Playback) {
-			v.Status = "paused"
-			v.OutputStatus = "connected"
-			if m.output == nil {
-				v.OutputStatus = "disconnected"
-			}
-			if err != nil {
+		outputErr := m.pauseOutput(ctx, action == "stop" || err != nil)
+		if err != nil {
+			m.setPlayback(func(v *model.Playback) {
 				v.Error = "暂停控制失败，音频输出已断开；请通过 Spotify 重试"
-			}
-		})
-		return err
+			})
+		}
+		return errors.Join(err, outputErr)
+	}
+	if action == "resume" {
+		r.pauseUnconfirmed = false
+		m.mu.Lock()
+		r.intent.revision++
+		r.intent.wantPlay = true
+		m.mu.Unlock()
 	}
 	if action == "seek" {
 		return r.player.Command(ctx, action, map[string]any{"position": value})

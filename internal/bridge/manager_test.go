@@ -16,13 +16,15 @@ import (
 )
 
 type fakePlayer struct {
-	mu        sync.Mutex
-	state     model.PlayerStatus
-	commands  []string
-	forward   func([]byte) error
-	closed    bool
-	drains    int
-	statusErr error
+	mu         sync.Mutex
+	state      model.PlayerStatus
+	commands   []string
+	forward    func([]byte) error
+	closed     bool
+	drains     int
+	statusErr  error
+	onCommand  func(string)
+	commandErr map[string]error
 }
 
 func (f *fakePlayer) Status(context.Context) (model.PlayerStatus, error) {
@@ -35,10 +37,18 @@ func (f *fakePlayer) Status(context.Context) (model.PlayerStatus, error) {
 	}
 	return v, f.statusErr
 }
-func (f *fakePlayer) Command(_ context.Context, a string, b any) error {
+func (f *fakePlayer) Command(_ context.Context, a string, b any) (err error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	defer func() {
+		f.mu.Unlock()
+		if err == nil && f.onCommand != nil {
+			f.onCommand(a)
+		}
+	}()
 	f.commands = append(f.commands, a)
+	if err := f.commandErr[a]; err != nil {
+		return err
+	}
 	switch a {
 	case "pause":
 		f.state.Paused = true
@@ -65,11 +75,12 @@ func (f *fakePlayer) write(b string) {
 }
 
 type fakeOutput struct {
-	mu              sync.Mutex
-	data            string
-	closed          bool
-	flushes, starts int
-	volume          int
+	mu                   sync.Mutex
+	data                 string
+	closed               bool
+	flushes, starts      int
+	volume               int
+	flushErr, standbyErr error
 }
 
 func (f *fakeOutput) Begin() { f.starts++ }
@@ -87,9 +98,9 @@ func (f *fakeOutput) Flush(context.Context) error {
 	defer f.mu.Unlock()
 	f.data = ""
 	f.flushes++
-	return nil
+	return f.flushErr
 }
-func (f *fakeOutput) Standby() error              { return nil }
+func (f *fakeOutput) Standby() error              { return f.standbyErr }
 func (f *fakeOutput) Volume(v int) error          { f.volume = v; return nil }
 func (f *fakeOutput) Metadata(*model.Track) error { return nil }
 func (f *fakeOutput) Close()                      { f.mu.Lock(); defer f.mu.Unlock(); f.closed = true }
@@ -116,6 +127,13 @@ func setup(t *testing.T) (*Manager, *fakePlayer, *fakePlayer, *[]*fakeOutput) {
 	b := &fakePlayer{state: model.PlayerStatus{Track: &model.Track{URI: "spotify:track:b", Position: 9000, SampleRate: 44100}}}
 	m.accounts["a"] = &runtimeAccount{player: a, generation: 1, status: "online"}
 	m.accounts["b"] = &runtimeAccount{player: b, generation: 1, status: "online"}
+	for id, player := range map[string]*fakePlayer{"a": a, "b": b} {
+		player.onCommand = func(action string) {
+			if action == "pause" {
+				m.emit(event{kind: "spotify", id: id, generation: 1, spotify: spotify.Event{Type: "paused"}})
+			}
+		}
+	}
 	t.Cleanup(func() { m.cancel(); m.detach(); m.closeOutput() })
 	return m, a, b, &outputs
 }
