@@ -53,9 +53,10 @@ func metadataText(t model.Track) string {
 
 func metadataCommand(t model.Track, artworkPath string) string {
 	command := metadataText(t) + fmt.Sprintf("DURATION=%d\n", t.Duration/1000)
-	if artworkPath != "" {
-		command += "ARTWORKFILE=" + artworkPath + "\n"
-	}
+	// Explicitly overwrite staging, even when empty: a partial earlier FIFO
+	// write must not leave another item's path for this SENDMETA to consume.
+	// Empty ARTWORKFILE only unstages; it does not clear retained MRP artwork.
+	command += "ARTWORKFILE=" + artworkPath + "\n"
 	// v0.5.3 resets elapsed time when ITEMID changes. Anchor progress AFTER
 	// SENDMETA; PROGRESS before it applies to the previous item and gets reset.
 	return command + "ACTION=SENDMETA\n" + progressCommand(t)

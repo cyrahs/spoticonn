@@ -130,7 +130,7 @@ func TestSenderArtworkDropsSupersededDownloadsAndUsesLatestPosition(t *testing.T
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatal("old image replaced current image", err)
 	}
-	if !strings.Contains(before, "TITLE=latest\nARTIST=artist\nALBUM=\nITEMID=new-track\nDURATION=0\nACTION=SENDMETA\nDURATION=0\nPROGRESS=9\n") || !strings.HasSuffix(before, "ARTWORK="+paths[0]+"\n") {
+	if !strings.Contains(before, "TITLE=latest\nARTIST=artist\nALBUM=\nITEMID=new-track\nDURATION=0\nARTWORKFILE=\nACTION=SENDMETA\nDURATION=0\nPROGRESS=9\n") || !strings.HasSuffix(before, "ARTWORK="+paths[0]+"\n") {
 		t.Fatal("download reverted refined metadata", before)
 	}
 }
@@ -544,7 +544,7 @@ func TestArtworkStartInterruptsBundleWait(t *testing.T) {
 			close(release)
 			waitArtwork(t, s)
 			trace = commands()
-			if strings.Count(trace, "ACTION=SENDMETA\n") != 1 || strings.Contains(trace, "ARTWORKFILE=") || len(artworkPaths(trace)) != 1 || !strings.Contains(trace, "\nARTWORK=") {
+			if strings.Count(trace, "ACTION=SENDMETA\n") != 1 || strings.Count(trace, "ARTWORKFILE=\n") != 1 || len(artworkPaths(trace)) != 1 || !strings.Contains(trace, "\nARTWORK=") {
 				t.Fatal("slow artwork resent the full metadata", trace)
 			}
 		})
@@ -632,5 +632,32 @@ func TestArtworkStopInterruptsBundleWait(t *testing.T) {
 	}
 	if commands() != "ACTION=STANDBY\n" {
 		t.Fatal("stopped metadata escaped its generation", commands())
+	}
+}
+
+func TestMetadataDiscardsArtworkStagedByInterruptedWrite(t *testing.T) {
+	binary := fakeBinary(t)
+	commandLog := filepath.Join(t.TempDir(), "commands")
+	t.Setenv("SPOTICONN_TEST_AIRPLAY_COMMANDS", commandLog)
+	s, err := Open(t.Context(), Config{Binary: binary, RuntimeDir: t.TempDir()}, model.Device{Address: "127.0.0.1", Port: 7000}, model.PairingSecret{}, 30, 44100, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	oldPath := filepath.Join(t.TempDir(), "old.jpg")
+	if err := os.WriteFile(oldPath, testArtwork(t, "jpeg"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the successfully written prefix of an interrupted bundle.
+	if err := s.command("ARTWORKFILE=" + oldPath + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Metadata(&model.Track{URI: "new-track"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Volume(42)
+	trace := waitForEngineCommands(t, commandLog, "VOLUME=42\n", 1)
+	if strings.Contains(trace, "ARTWORK_LOADED") || strings.Contains(trace, "ARTWORK_LOAD_FAILED") {
+		t.Fatal("new item consumed another item's staged artwork", trace)
 	}
 }
