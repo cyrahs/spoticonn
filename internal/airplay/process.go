@@ -26,6 +26,7 @@ type Config struct {
 	RemoteControl                   func(RemoteCommand) // must not block the engine reader
 	Artwork                         *ArtworkCache
 	Diagnostic                      func(string)
+	GroupStatus                     func(context.Context, string) // playback-intent-scoped member status
 }
 type Sender struct {
 	id             string
@@ -472,7 +473,7 @@ func (s *Sender) Write(b []byte) error {
 	for len(b) > 0 {
 		n, err := s.input.Write(b)
 		if err != nil {
-			return errors.New("AirPlay 音频写入失败")
+			return &audioWriteError{reason: audioWriteReason(err)}
 		}
 		if n == 0 {
 			return io.ErrShortWrite
@@ -480,6 +481,28 @@ func (s *Sender) Write(b []byte) error {
 		b = b[n:]
 	}
 	return nil
+}
+
+// Preserve useful error classes without exposing OS paths or engine output.
+type audioWriteError struct{ reason string }
+
+func (e *audioWriteError) Error() string { return "AirPlay 音频写入失败：" + e.reason }
+
+func audioWriteReason(err error) string {
+	var classified *audioWriteError
+	if errors.As(err, &classified) {
+		return classified.reason
+	}
+	switch {
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
+		return "write_timeout"
+	case errors.Is(err, os.ErrClosed), errors.Is(err, io.ErrClosedPipe), errors.Is(err, syscall.EPIPE):
+		return "pipe_closed"
+	case errors.Is(err, io.ErrShortWrite):
+		return "short_write"
+	default:
+		return "audio"
+	}
 }
 func (s *Sender) Flush(ctx context.Context) error {
 	s.mu.Lock()

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"spoticonn/internal/model"
@@ -48,16 +49,39 @@ type groupOutput struct {
 	closed             bool
 	ring               []byte
 	total              int64
+	retryDelays        []time.Duration // nil uses the bounded production policy
 }
 type groupCycle struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	done    chan struct{}
-	changed chan struct{}
-	failed  chan string
-	queue   chan []byte
-	feeding bool
-	skip    int64
+	ctx         context.Context
+	intent      context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	changed     chan struct{}
+	queue       chan []byte
+	feeding     bool
+	skip        int64
+	epoch       uint64
+	attempt     *memberAttempt
+	blocked     *memberFailure // a HomePod failure invalidates every member attempt
+	startCancel context.CancelFunc
+}
+
+var groupEpoch atomic.Uint64
+
+type memberFailure struct {
+	role, reason, phase string
+	queue, primeBytes   int
+	elapsedMS, deltaMS  int64
+}
+
+type memberAttempt struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
+	phase        string
+	failure      *memberFailure
+	primeBytes   int
+	deltaMS      int64
+	writeStarted time.Time
 }
 
 func OpenHomeTheater(ctx context.Context, cfg Config, target Target, pairings map[string]model.PairingSecret, volume, rate int, status, diagnostic func(string)) (Output, error) {
@@ -106,186 +130,403 @@ func OpenHomeTheater(ctx context.Context, cfg Config, target Target, pairings ma
 }
 
 func (g *groupOutput) primaryStatus(s string) {
-	if s == "timeline_changed" {
+	var failure *memberFailure
+	var epoch uint64
+	switch s {
+	case "timeline_changed", "error", "disconnected", "clock_stalled":
 		g.mu.Lock()
-		if c := g.cycle; c != nil {
+		if c := g.cycle; c != nil && c.ctx.Err() == nil {
+			if c.blocked == nil {
+				c.blocked = &memberFailure{role: "homepod", reason: s, phase: "start"}
+				if a := c.attempt; a != nil {
+					c.blocked.phase = a.phase
+					g.failMemberLocked(c, a, "homepod", s)
+				}
+				if c.startCancel != nil {
+					c.startCancel()
+				}
+				failure, epoch = c.blocked, c.epoch
+			}
 			select {
-			case c.failed <- "timeline_changed":
+			case c.changed <- struct{}{}:
 			default:
 			}
 		}
 		g.mu.Unlock()
-		return
 	}
-	g.status(s)
+	if failure != nil {
+		// Whole-output recovery can close this cycle as soon as status is
+		// forwarded. Persist the primary source before that cancellation.
+		g.diagnostic(fmt.Sprintf("组合事件：cycle=%d role=homepod phase=%s reason=%s", epoch, failure.phase, failure.reason))
+	}
+	if s != "timeline_changed" {
+		g.status(s)
+	}
 }
 
 func (g *groupOutput) report(state string) {
-	// Only fixed role/state codes reach diagnostics; no engine output or args.
 	g.status(state)
 	g.diagnostic("组合状态：" + state)
 }
 
+func (g *groupOutput) reportCycle(c *groupCycle, state string) {
+	if c.ctx.Err() != nil {
+		return
+	}
+	if g.cfg.GroupStatus != nil {
+		g.cfg.GroupStatus(c.intent, state)
+	} else {
+		g.status(state)
+	}
+	g.diagnostic("组合状态：" + state)
+}
+
 func (g *groupOutput) Begin() {
+	g.BeginWithContext(g.ctx)
+}
+
+// The bridge supplies an independent playback-intent lifetime. Cancelling it
+// stops only the optional member, including while a transport command waits.
+func (g *groupOutput) BeginWithContext(intent context.Context) {
 	g.lifecycle.Lock()
 	defer g.lifecycle.Unlock()
 	g.mu.Lock()
-	if g.closed || g.cycle != nil {
+	if g.closed || g.ctx.Err() != nil || intent.Err() != nil || g.cycle != nil {
 		g.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithCancel(g.ctx)
-	c := &groupCycle{ctx: ctx, cancel: cancel, done: make(chan struct{}), changed: make(chan struct{}, 1), failed: make(chan string, 1), queue: make(chan []byte, 128)}
+	ctx, cancel := context.WithCancel(intent)
+	stop := context.AfterFunc(g.ctx, cancel)
+	c := &groupCycle{ctx: ctx, intent: intent, cancel: cancel, done: make(chan struct{}), changed: make(chan struct{}, 1), epoch: groupEpoch.Add(1)}
 	g.cycle = c
 	g.mu.Unlock()
-	g.report("group_starting")
+	g.reportCycle(c, "group_starting")
 	g.primary.Begin()
-	go g.run(c)
+	go func() { defer stop(); defer cancel(); g.run(c) }()
+}
+
+// Only known engine events and local error classes enter this record. The first
+// failure wins, before cancelling I/O can produce secondary disconnect errors.
+func (g *groupOutput) failMemberLocked(c *groupCycle, a *memberAttempt, role, reason string) {
+	if a == nil || c.attempt != a || c.ctx.Err() != nil || a.ctx.Err() != nil || a.failure != nil {
+		return
+	}
+	f := &memberFailure{role: role, reason: reason, phase: a.phase, queue: len(c.queue), primeBytes: a.primeBytes, deltaMS: a.deltaMS}
+	if !a.writeStarted.IsZero() {
+		f.elapsedMS = time.Since(a.writeStarted).Milliseconds()
+	}
+	a.failure = f
+	c.feeding = false
+	a.cancel()
+}
+
+func (g *groupOutput) failMember(c *groupCycle, a *memberAttempt, reason string) {
+	g.mu.Lock()
+	g.failMemberLocked(c, a, "apple_tv", reason)
+	g.mu.Unlock()
+}
+
+func (g *groupOutput) reportFailure(c *groupCycle, attempt int, f *memberFailure, retry bool, delay time.Duration) {
+	if c.ctx.Err() != nil {
+		return
+	}
+	g.diagnostic(fmt.Sprintf("组合故障：cycle=%d attempt=%d role=%s phase=%s reason=%s queue=%d prime_bytes=%d elapsed_ms=%d start_delta_ms=%d retry=%t backoff_ms=%d",
+		c.epoch, attempt, f.role, f.phase, f.reason, f.queue, f.primeBytes, f.elapsedMS, f.deltaMS, retry, delay.Milliseconds()))
+	state := "group_degraded_" + f.reason
+	if f.role == "homepod" {
+		state = "group_degraded_homepod_" + f.reason
+	}
+	if retry {
+		state = "group_retrying_" + f.reason
+	}
+	g.reportCycle(c, state)
+}
+
+// Waiting for new PCM after each failure prevents a quiet/paused source from
+// triggering a new member session solely because a backoff timer elapsed.
+func (g *groupOutput) waitAudio(c *groupCycle, anchor, after int64) *memberFailure {
+	ctx, cancel := context.WithTimeout(c.ctx, 20*time.Second)
+	defer cancel()
+	for {
+		if c.ctx.Err() != nil {
+			return nil
+		}
+		g.mu.Lock()
+		blocked, total := c.blocked, g.total
+		g.mu.Unlock()
+		if blocked != nil {
+			return blocked
+		}
+		if total > after && time.Now().UnixMilli() >= anchor {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return &memberFailure{role: "homepod", phase: "start", reason: "unstable"}
+		case <-c.changed:
+		}
+	}
 }
 
 func (g *groupOutput) run(c *groupCycle) {
 	defer close(c.done)
 	defer func() { g.mu.Lock(); c.feeding = false; g.mu.Unlock() }()
 	ctx, cancel := context.WithTimeout(c.ctx, 20*time.Second)
-	defer cancel()
+	g.mu.Lock()
+	c.startCancel = cancel
+	if c.blocked != nil {
+		cancel()
+	}
+	g.mu.Unlock()
 	anchor, err := g.primary.Started(ctx)
+	cancel()
+	g.mu.Lock()
+	c.startCancel = nil
+	blocked := c.blocked
+	g.mu.Unlock()
 	if err != nil {
 		if c.ctx.Err() == nil {
+			if blocked != nil {
+				g.reportFailure(c, 0, blocked, false, 0)
+				return
+			}
+			g.reportFailure(c, 0, &memberFailure{role: "homepod", phase: "start", reason: "start"}, false, 0)
 			g.status("error")
 		}
 		return
 	}
-	g.diagnostic("HomePod 已确认开始；等待实际开始时间及持续音频")
-	// Wait on confirmed playout plus continued PCM, not a guessed join delay.
-	for {
-		select {
-		case <-ctx.Done():
-			if c.ctx.Err() == nil {
-				g.report("group_degraded_unstable")
-			}
-			return
-		case <-c.failed:
-			g.report("group_degraded_timeline")
-			return
-		case <-c.changed:
-			if time.Now().UnixMilli() >= anchor {
-				goto stable
-			}
-		}
-	}
-stable:
-	if !g.tv.Online {
-		g.report("group_degraded_offline")
-		return
-	}
-	if !g.cfg.SharedPTP {
-		g.report("group_degraded_clock")
-		return
-	}
-	g.report("group_joining")
-	g.mu.Lock()
-	volume := g.volume
-	g.mu.Unlock()
-	tv, err := g.open(c.ctx, g.cfg, g.tv, g.pair, volume, g.rate, func(s string) {
-		switch s {
-		case "error", "disconnected", "clock_stalled", "timeline_changed":
-			select {
-			case c.failed <- s:
-			default:
-			}
-		}
-	})
-	if err != nil {
-		if c.ctx.Err() == nil {
-			if errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrAuthFailed) {
-				g.report("group_degraded_auth")
-			} else {
-				g.report("group_degraded_connect")
-			}
-		}
-		return
-	}
-	defer tv.Close()
-	// The process inherits the cycle, not the setup timeout. Open itself has a
-	// bounded readiness wait; only Join uses the remaining setup deadline.
-	g.mu.Lock()
-	volume, track := g.volume, g.track
-	g.mu.Unlock()
-	if err := tv.Volume(volume); err != nil {
-		g.report("group_degraded_control")
-		return
-	}
-	if err := tv.Metadata(track); err != nil {
-		g.report("group_degraded_control")
-		return
-	}
-	g.diagnostic(fmt.Sprintf("Apple TV 加入前应用当前音量：%d", volume))
-	actual, err := tv.Join(ctx, time.Now().Add(500*time.Millisecond).UnixMilli())
-	if err != nil {
-		if c.ctx.Err() == nil {
-			g.report("group_degraded_start")
-		}
-		return
-	}
-	select {
-	case <-c.failed:
-		g.report("group_degraded_timeline")
-		return
-	default:
-	}
-	g.mu.Lock()
-	// Reject a lost/changed timeline; do not restart HomePod to rescue the TV.
-	prime, skip, mapErr := joinPCM(g.ring, g.total, anchor, actual, g.rate)
-	if mapErr == nil && c.ctx.Err() == nil {
-		c.skip, c.feeding = skip, true
-	}
-	g.mu.Unlock()
-	if mapErr != nil {
-		g.report("group_degraded_timeline")
+	if f := g.waitAudio(c, anchor, 0); f != nil {
+		g.reportFailure(c, 0, f, false, 0)
 		return
 	}
 	if c.ctx.Err() != nil {
 		return
 	}
+	if !g.tv.Online {
+		g.reportFailure(c, 0, &memberFailure{role: "apple_tv", phase: "connect", reason: "offline"}, false, 0)
+		return
+	}
+	if !g.cfg.SharedPTP {
+		g.reportFailure(c, 0, &memberFailure{role: "apple_tv", phase: "connect", reason: "clock"}, false, 0)
+		return
+	}
+	delays := g.retryDelays
+	if delays == nil {
+		delays = []time.Duration{time.Second, 3 * time.Second}
+	}
+	for attempt := 1; ; attempt++ {
+		if c.ctx.Err() != nil {
+			return
+		}
+		a := g.runMember(c, anchor, attempt)
+		if c.ctx.Err() != nil {
+			return
+		}
+		g.mu.Lock()
+		f, blocked := a.failure, c.blocked
+		g.mu.Unlock()
+		if f == nil {
+			return
+		}
+		retry := blocked == nil && f.recoverable() && attempt <= len(delays)
+		var delay time.Duration
+		if retry {
+			delay = delays[attempt-1]
+		}
+		g.reportFailure(c, attempt, f, retry, delay)
+		if blocked != nil && f.role != "homepod" {
+			g.reportFailure(c, attempt, blocked, false, 0)
+		}
+		if !retry {
+			return
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-c.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		g.mu.Lock()
+		after := g.total
+		g.mu.Unlock()
+		if f := g.waitAudio(c, anchor, after); f != nil {
+			g.reportFailure(c, attempt, f, false, 0)
+			return
+		}
+	}
+}
+
+func (f *memberFailure) recoverable() bool {
+	if f.role != "apple_tv" {
+		return false
+	}
+	switch f.reason {
+	case "disconnected", "write_timeout", "pipe_closed", "backpressure":
+		return true
+	}
+	return false
+}
+
+// Each attempt has its own cancellation and queue. Close completes before the
+// next Open, and callbacks from a retired attempt cannot affect its successor.
+func (g *groupOutput) runMember(c *groupCycle, anchor int64, number int) *memberAttempt {
+	ctx, cancel := context.WithCancel(c.ctx)
+	a := &memberAttempt{ctx: ctx, cancel: cancel, phase: "connect"}
+	g.mu.Lock()
+	c.attempt = a
+	c.queue = make(chan []byte, 128)
+	volume, blocked := g.volume, c.blocked
+	if blocked != nil {
+		a.failure = blocked
+		cancel()
+	}
+	g.mu.Unlock()
+	var tv timedOutput
+	defer func() {
+		g.mu.Lock()
+		c.feeding = false
+		c.attempt = nil
+		c.queue = nil
+		cancel()
+		g.mu.Unlock()
+		if tv != nil {
+			tv.Close()
+		}
+	}()
+	if ctx.Err() != nil {
+		return a
+	}
+	if number == 1 {
+		g.reportCycle(c, "group_joining")
+	}
+	var err error
+	tv, err = g.open(ctx, g.cfg, g.tv, g.pair, volume, g.rate, func(s string) {
+		switch s {
+		case "error", "disconnected", "clock_stalled", "timeline_changed":
+			g.failMember(c, a, s)
+		}
+	})
+	if err != nil {
+		reason := "connect"
+		if errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrAuthFailed) {
+			reason = "auth"
+			// A generic engine error may have arrived just before Open returns
+			// its more specific, typed authentication failure.
+			g.mu.Lock()
+			if a.failure != nil && a.failure.role == "apple_tv" && a.failure.reason == "error" {
+				a.failure.reason = reason
+			}
+			g.mu.Unlock()
+		}
+		g.failMember(c, a, reason)
+		return a
+	}
+	if ctx.Err() != nil {
+		return a
+	}
+	g.mu.Lock()
+	a.phase = "control"
+	volume, track := g.volume, g.track
+	g.mu.Unlock()
+	if err := tv.Volume(volume); err != nil {
+		g.failMember(c, a, "control")
+		return a
+	}
+	if err := tv.Metadata(track); err != nil {
+		g.failMember(c, a, "control")
+		return a
+	}
+	g.mu.Lock()
+	a.phase = "join"
+	g.mu.Unlock()
+	setup, finishSetup := context.WithTimeout(ctx, 20*time.Second)
+	requested := time.Now().Add(500 * time.Millisecond).UnixMilli()
+	actual, err := tv.Join(setup, requested)
+	finishSetup()
+	if err != nil {
+		g.failMember(c, a, "start")
+		return a
+	}
+	if ctx.Err() != nil {
+		return a
+	}
+	g.mu.Lock()
+	prime, skip, mapErr := joinPCM(g.ring, g.total, anchor, actual, g.rate)
+	a.deltaMS, a.primeBytes = actual-requested, len(prime)
+	if mapErr == nil && ctx.Err() == nil && c.blocked == nil {
+		c.skip, c.feeding = skip, true
+	}
+	g.mu.Unlock()
+	if mapErr != nil {
+		g.failMember(c, a, "timeline")
+		return a
+	}
+	if ctx.Err() != nil {
+		return a
+	}
+	g.diagnostic(fmt.Sprintf("组合加入：cycle=%d attempt=%d role=apple_tv phase=join prime_bytes=%d start_delta_ms=%d skip_frames=%d", c.epoch, number, len(prime), actual-requested, skip/4))
+	if len(prime) > 0 && !g.writeMember(c, a, tv, prime, "prime") {
+		return a
+	}
+	if ctx.Err() != nil {
+		return a
+	}
+	g.mu.Lock()
+	a.phase = "stream"
+	g.mu.Unlock()
+	g.reportCycle(c, "group_joined")
+	// Apply controls again: they may have changed during Open/Join/prime.
 	select {
 	case c.changed <- struct{}{}:
 	default:
 	}
-	g.diagnostic(fmt.Sprintf("Apple TV 开始确认：相对 HomePod %d ms；待跳过 %d 帧", actual-anchor, skip/4))
-	if len(prime) > 0 {
-		if err := tv.Write(prime); err != nil {
-			g.report("group_degraded_audio")
-			return
-		}
-	}
-	g.report("group_joined")
-	// Setup succeeded. Keep the TV alive until the parent cycle ends.
 	for {
+		if ctx.Err() != nil {
+			return a
+		}
 		select {
-		case <-c.ctx.Done():
-			return
-		case <-c.failed:
-			g.report("group_degraded_member")
-			return
+		case <-ctx.Done():
+			return a
 		case data := <-c.queue:
-			if err := tv.Write(data); err != nil {
-				g.report("group_degraded_audio")
-				return
+			if !g.writeMember(c, a, tv, data, "stream") {
+				return a
 			}
 		case <-c.changed:
 			g.mu.Lock()
+			a.phase = "control"
 			volume, track := g.volume, g.track
 			g.mu.Unlock()
 			if err := tv.Volume(volume); err != nil {
-				g.report("group_degraded_control")
-				return
+				g.failMember(c, a, "control")
+				return a
 			}
 			if err := tv.Metadata(track); err != nil {
-				g.report("group_degraded_control")
-				return
+				g.failMember(c, a, "control")
+				return a
 			}
+			g.mu.Lock()
+			a.phase = "stream"
+			g.mu.Unlock()
 		}
 	}
+}
+
+func (g *groupOutput) writeMember(c *groupCycle, a *memberAttempt, tv timedOutput, data []byte, phase string) bool {
+	if a.ctx.Err() != nil {
+		return false
+	}
+	g.mu.Lock()
+	a.phase, a.writeStarted = phase, time.Now()
+	g.mu.Unlock()
+	err := tv.Write(data)
+	if err != nil {
+		g.failMember(c, a, audioWriteReason(err))
+	}
+	g.mu.Lock()
+	a.writeStarted = time.Time{}
+	g.mu.Unlock()
+	return err == nil && a.ctx.Err() == nil
 }
 
 // joinPCM maps the acknowledged instant to absolute s16le stereo frame
@@ -323,7 +564,7 @@ func (g *groupOutput) Write(b []byte) error {
 	if len(g.ring) > limit {
 		g.ring = g.ring[len(g.ring)-limit:]
 	}
-	if c := g.cycle; c != nil {
+	if c := g.cycle; c != nil && c.ctx.Err() == nil {
 		// Signal only while starting; control updates use changed after joining.
 		if !c.feeding {
 			select {
@@ -340,10 +581,7 @@ func (g *groupOutput) Write(b []byte) error {
 				case c.queue <- append([]byte(nil), b...):
 				default:
 					c.feeding = false
-					select {
-					case c.failed <- "backpressure":
-					default:
-					}
+					g.failMemberLocked(c, c.attempt, "apple_tv", "backpressure")
 				}
 			}
 		}
@@ -351,7 +589,7 @@ func (g *groupOutput) Write(b []byte) error {
 	return nil
 }
 
-func (g *groupOutput) cancelCycle() {
+func (g *groupOutput) cancelCycle(reason string) {
 	g.mu.Lock()
 	c := g.cycle
 	if c != nil {
@@ -360,6 +598,7 @@ func (g *groupOutput) cancelCycle() {
 	g.mu.Unlock()
 	if c != nil {
 		<-c.done
+		g.diagnostic(fmt.Sprintf("组合取消：cycle=%d reason=%s", c.epoch, reason))
 	}
 	g.mu.Lock()
 	g.cycle = nil
@@ -381,6 +620,7 @@ func (g *groupOutput) CancelJoin() {
 	g.mu.Unlock()
 	if c != nil {
 		<-c.done
+		g.diagnostic(fmt.Sprintf("组合取消：cycle=%d reason=transport", c.epoch))
 	}
 	g.report("group_waiting")
 }
@@ -388,14 +628,14 @@ func (g *groupOutput) CancelJoin() {
 func (g *groupOutput) Flush(ctx context.Context) error {
 	g.lifecycle.Lock()
 	defer g.lifecycle.Unlock()
-	g.cancelCycle()
+	g.cancelCycle("flush")
 	g.report("group_waiting")
 	return g.primary.Flush(ctx)
 }
 func (g *groupOutput) Standby() error {
 	g.lifecycle.Lock()
 	defer g.lifecycle.Unlock()
-	g.cancelCycle()
+	g.cancelCycle("standby")
 	g.report("group_waiting")
 	return g.primary.Standby()
 }
@@ -437,7 +677,7 @@ func (g *groupOutput) Close() {
 	g.closed = true
 	g.mu.Unlock()
 	g.cancel()
-	g.cancelCycle()
+	g.cancelCycle("close")
 	g.primary.Close()
 	if g.clock != nil {
 		g.clock.Close()

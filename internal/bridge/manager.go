@@ -57,6 +57,8 @@ type event struct {
 	intent                  uint64
 	remote                  airplay.RemoteCommand
 	playerGeneration        uint64
+	memberIntent            context.Context
+	joinRevision            uint64
 }
 type Manager struct {
 	mu                                 sync.Mutex // snapshots and runtime fields
@@ -130,6 +132,10 @@ func (m *Manager) emit(e event) {
 	// process waits for its output readers. Coalesce repeated notifications,
 	// keeping their latest order; playback events are checked against live state.
 	m.eventMu.Lock()
+	if e.memberIntent != nil && e.memberIntent.Err() != nil {
+		m.eventMu.Unlock()
+		return
+	}
 	if e.kind == "remote" && (e.remote.Context == nil || e.remote.Context.Err() != nil) {
 		m.eventMu.Unlock()
 		return // an old member must not replace a newer member's queued request
@@ -555,6 +561,9 @@ func (m *Manager) handle(e event) {
 			return
 		}
 		if strings.HasPrefix(e.status, "group_") {
+			if e.memberIntent != nil && e.memberIntent.Err() != nil {
+				return
+			}
 			m.mu.Lock()
 			id := m.playback.AccountID
 			m.mu.Unlock()
@@ -637,7 +646,7 @@ func (m *Manager) handle(e event) {
 			return
 		} // stale events must never take over
 		m.mu.Lock()
-		if e.intent != r.intent.revision {
+		if e.intent != r.intent.revision || e.joinRevision != r.intent.joinRevision {
 			m.mu.Unlock()
 			return
 		}
@@ -672,7 +681,7 @@ func (m *Manager) handle(e event) {
 		}
 	case "will_play", "seek":
 		m.mu.Lock()
-		current := m.playback.AccountID == e.id
+		current := m.playback.AccountID == e.id && e.joinRevision == r.intent.joinRevision
 		m.mu.Unlock()
 		if current && m.output != nil {
 			m.detach()
@@ -684,7 +693,7 @@ func (m *Manager) handle(e event) {
 			if e.spotify.Type == "seek" {
 				status, err := p.Status(ctx)
 				if err == nil && !status.Paused && !status.Stopped {
-					m.output.Begin()
+					m.beginOutput(m.playbackRequest(e.id))
 					p.Route(sampleRate(status.Track), m.output.Write)
 					_ = m.output.Metadata(status.Track)
 				}
@@ -747,6 +756,11 @@ func (m *Manager) detach() {
 	}
 }
 func (m *Manager) closeOutput() {
+	m.mu.Lock()
+	if r := m.accounts[m.playback.AccountID]; r != nil {
+		cancelJoin(r)
+	}
+	m.mu.Unlock()
 	m.outputGeneration++
 	if m.outputCancel != nil {
 		m.outputCancel()
@@ -770,6 +784,9 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	old := m.playback.AccountID
 	r := m.accounts[id]
 	previous := m.accounts[old]
+	if previous != nil && old != id {
+		invalidateJoin(previous)
+	}
 	m.mu.Unlock()
 	if r == nil || r.player == nil {
 		return errors.New("Spotify 会话不可用")
@@ -807,7 +824,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 			return errPlaybackSuperseded
 		}
 		m.outputParked = false
-		m.output.Begin()
+		m.beginOutput(q)
 		r.player.Route(rate, m.output.Write)
 		_ = m.output.Metadata(status.Track)
 		m.setPlayback(func(v *model.Playback) { v.Status = "playing"; v.Error = ""; v.Track = status.Track })
@@ -845,6 +862,9 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 	generation := m.outputGeneration
 	playerGeneration := r.generation
 	cfg := m.airplayConfig()
+	cfg.GroupStatus = func(intent context.Context, state string) {
+		m.emit(event{kind: "output", generation: generation, status: state, memberIntent: intent})
+	}
 	cfg.RemoteControl = func(command airplay.RemoteCommand) {
 		m.emit(event{kind: "remote", id: id, generation: generation, playerGeneration: playerGeneration, remote: command})
 	}
@@ -896,7 +916,7 @@ func (m *Manager) acquire(id string, status model.PlayerStatus) error {
 		return errPlaybackSuperseded
 	}
 	r.player.Drain()
-	output.Begin()
+	m.beginOutput(q)
 	_ = output.Metadata(status.Track)
 	r.player.Route(rate, output.Write)
 	if !m.requestCurrent(q) {
@@ -1220,6 +1240,13 @@ func (m *Manager) Playback(ctx context.Context, action string, value int64) erro
 	if action == "pause" || action == "stop" {
 		requestedID, requestedGeneration = m.interruptPlayback("", true)
 	}
+	if action == "next" || action == "prev" || (action == "seek" && value >= 0) {
+		m.mu.Lock()
+		if r := m.accounts[m.playback.AccountID]; r != nil {
+			invalidateJoin(r)
+		}
+		m.mu.Unlock()
+	}
 	m.op.Lock()
 	defer m.op.Unlock()
 	if action != "volume" {
@@ -1250,6 +1277,11 @@ func (m *Manager) playbackCommand(ctx context.Context, action string, value int6
 		return errors.New("播放位置不可为负数")
 	}
 	if action == "seek" || action == "next" || action == "prev" {
+		m.mu.Lock()
+		if r := m.accounts[m.playback.AccountID]; r != nil {
+			invalidateJoin(r)
+		}
+		m.mu.Unlock()
 		if group, ok := m.output.(interface{ CancelJoin() }); ok {
 			group.CancelJoin()
 		}
