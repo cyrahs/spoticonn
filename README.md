@@ -93,6 +93,7 @@ export SPOTICONN_ADMIN_PASSWORD='替换为至少12字节的管理密码'
 - 音量由 AirPlay 接收端应用；Spotify 引擎关闭 PCM 音量衰减。组合各成员使用当前设定值，加入过程中不会提高音量。
 - 两成员 Apple TV + HomePod 组合共享 PTP 时钟。Apple TV 加入失败时 HomePod 继续播放，网页显示原因；本次播放不自动重试该成员。暂停、切歌、seek、停止和切换输出会取消加入操作。较大组合（含两个 HomePod 的立体声组合）尚未验证分阶段启动，仍保留原有主设备路径。
 - Spotify iOS App 的 Connect 控制与 iOS 控制中心“控制其他扬声器与电视”是不同能力。当前桥接通过 Spotify Connect 控制播放，未实现 iOS 原生控制中心接管；实机出声与控制验收见 [组合验收记录](docs/ISSUE_5_VALIDATION.md)。
+- 专辑封面在后台下载并缓存，Apple TV 晚加入、切歌及重连时发送当前封面；下载失败不阻断音频或文本元数据。支持公网 HTTPS 的 JPEG/PNG，Apple MediaRemote 使用 JPEG；接口限制和实机检查见 [封面验收说明](docs/ISSUE_7_VALIDATION.md)。
 - Spotify 子进程失败后退避重启；AirPlay 出错时先暂停 Spotify，再以退避方式重连并恢复当前请求。网页主动暂停会取消输出自动恢复。
 - 服务重启后恢复账号在线状态，不主动开始播放。设备离线不使管理服务健康检查失败。
 

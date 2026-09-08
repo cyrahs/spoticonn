@@ -270,7 +270,7 @@ func (m *Manager) discover() {
 }
 
 func (m *Manager) airplayConfig() airplay.Config {
-	c := airplay.Config{Binary: m.cfg.AirPlayBinary, RuntimeDir: m.cfg.RuntimeDir}
+	c := airplay.Config{Binary: m.cfg.AirPlayBinary, RuntimeDir: m.cfg.RuntimeDir, Diagnostic: m.diagnostic}
 	if m.cfg.Interface != "" {
 		if i, err := net.InterfaceByName(m.cfg.Interface); err == nil {
 			if addresses, err := i.Addrs(); err == nil {

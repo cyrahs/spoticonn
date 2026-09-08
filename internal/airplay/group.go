@@ -412,6 +412,7 @@ func (g *groupOutput) Metadata(t *model.Track) error {
 	g.mu.Lock()
 	if t != nil {
 		copied := *t
+		copied.Artists = append([]string(nil), t.Artists...)
 		g.track = &copied
 	} else {
 		g.track = nil
