@@ -400,3 +400,60 @@ func TestSenderReturnsSafeAuthenticationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestSenderWritePreservesPipeFailureClass(t *testing.T) {
+	for _, reason := range []string{"write_timeout", "pipe_closed"} {
+		t.Run(reason, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			defer w.Close()
+			if reason == "pipe_closed" {
+				r.Close()
+			}
+			s := &Sender{input: w}
+			err = s.Write(make([]byte, 8<<20)) // exceed the real pipe capacity with no reader
+			if err == nil || audioWriteReason(err) != reason {
+				t.Fatalf("got %v, want %s", err, reason)
+			}
+			if strings.Contains(err.Error(), "|") || strings.Contains(err.Error(), "/private/") {
+				t.Fatal("raw OS error leaked")
+			}
+		})
+	}
+}
+
+func TestGroupReplaysStructuredEngineTimelineEvents(t *testing.T) {
+	for _, role := range []string{"homepod", "apple_tv"} {
+		for _, line := range []string{"[STATUS] REANCHOR secret=never-log", "[STATUS] anchor_corrected secret=never-log"} {
+			t.Run(role+line, func(t *testing.T) {
+				g, p, events := testGroup(t)
+				logs := groupLogs(g)
+				tv := &testMember{anchor: p.anchor + 10}
+				g.open = func(ctx context.Context, _ Config, _ model.Device, _ model.PairingSecret, _, _ int, cb func(string)) (timedOutput, error) {
+					tv.ctx, tv.callback = ctx, cb
+					return tv, nil
+				}
+				close(p.ack)
+				g.Begin()
+				_ = g.Write(make([]byte, 3528))
+				waitGroup(t, events, "group_joined")
+				callback := tv.callback
+				want := "group_degraded_timeline_changed"
+				if role == "homepod" {
+					callback = g.primaryStatus
+					want = "group_degraded_homepod_timeline_changed"
+				}
+				sender := &Sender{status: callback}
+				sender.scan(strings.NewReader(line + "\n"))
+				waitGroup(t, events, want)
+				got := waitLog(t, logs, "role="+role, "reason=timeline_changed", "retry=false")
+				if strings.Contains(got, "never-log") {
+					t.Fatal("raw engine output leaked")
+				}
+			})
+		}
+	}
+}

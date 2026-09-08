@@ -22,6 +22,8 @@ type testMember struct {
 	joinGate                               chan struct{}
 	writeGate                              chan struct{}
 	joinErr                                error
+	writeErr                               error
+	requested                              int64
 	callback                               func(string)
 	ctx                                    context.Context
 }
@@ -37,9 +39,10 @@ func (f *testMember) Started(ctx context.Context) (int64, error) {
 	defer f.mu.Unlock()
 	return f.anchor, nil
 }
-func (f *testMember) Join(ctx context.Context, _ int64) (int64, error) {
+func (f *testMember) Join(ctx context.Context, requested int64) (int64, error) {
 	f.mu.Lock()
 	f.joins++
+	f.requested = requested
 	f.mu.Unlock()
 	if f.joinGate != nil {
 		select {
@@ -62,6 +65,9 @@ func (f *testMember) Write(b []byte) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.writeErr != nil {
+		return f.writeErr
+	}
 	f.data = append(f.data, b...)
 	return nil
 }
@@ -84,6 +90,7 @@ func testGroup(t *testing.T) (*groupOutput, *testMember, chan string) {
 	primary := &testMember{anchor: time.Now().Add(-time.Second).UnixMilli(), ack: make(chan struct{})}
 	events := make(chan string, 100)
 	g := &groupOutput{ctx: ctx, cancel: cancel, cfg: Config{SharedPTP: true}, primary: primary, tv: model.Device{ID: "tv", Online: true, Address: "192.0.2.10"}, pair: model.PairingSecret{Credentials: "tv-secret"}, rate: 44100, volume: 27, status: func(s string) { events <- s }, diagnostic: func(string) {}}
+	g.retryDelays = []time.Duration{} // tests opt in to retry timing explicitly
 	t.Cleanup(g.Close)
 	return g, primary, events
 }
@@ -212,7 +219,7 @@ func TestGroupJoinFailuresNeverStopOrRetryHomePod(t *testing.T) {
 			close(p.ack)
 			g.Begin()
 			_ = g.Write(make([]byte, 3528))
-			states := map[string]string{"offline": "group_degraded_offline", "clock": "group_degraded_clock", "open": "group_degraded_connect", "auth_required": "group_degraded_auth", "auth_failed": "group_degraded_auth", "start": "group_degraded_start", "timeline": "group_degraded_timeline", "disconnect": "group_degraded_member", "backpressure": "group_degraded_member"}
+			states := map[string]string{"offline": "group_degraded_offline", "clock": "group_degraded_clock", "open": "group_degraded_connect", "auth_required": "group_degraded_auth", "auth_failed": "group_degraded_auth", "start": "group_degraded_start", "timeline": "group_degraded_timeline", "disconnect": "group_degraded_disconnected", "backpressure": "group_degraded_backpressure"}
 			if scenario == "disconnect" {
 				waitGroup(t, events, "group_joined")
 				tv.callback("disconnected")

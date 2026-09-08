@@ -19,6 +19,9 @@ type playbackIntent struct {
 	internalPaused bool
 	pauseAck       chan struct{}
 	cancel         context.CancelFunc
+	joinContext    context.Context
+	joinCancel     context.CancelFunc
+	joinRevision   uint64
 }
 
 type playbackRequest struct {
@@ -26,10 +29,12 @@ type playbackRequest struct {
 	account            *runtimeAccount
 	player             Player
 	generation, intent uint64
+	joinRevision       uint64
 	target             string
 }
 
 func invalidateIntent(r *runtimeAccount, pause bool) {
+	invalidateJoin(r)
 	r.intent.revision++
 	if pause {
 		r.intent.wantPlay = false
@@ -38,6 +43,39 @@ func invalidateIntent(r *runtimeAccount, pause bool) {
 	if r.intent.cancel != nil {
 		r.intent.cancel()
 		r.intent.cancel = nil
+	}
+}
+
+func invalidateJoin(r *runtimeAccount) {
+	r.intent.joinRevision++
+	cancelJoin(r)
+}
+
+func cancelJoin(r *runtimeAccount) {
+	if r.intent.joinCancel != nil {
+		r.intent.joinCancel()
+	}
+	r.intent.joinContext, r.intent.joinCancel = nil, nil
+}
+
+// Member retries share the current user intent, never the Spotify resume path.
+// Repeated playing notifications reuse the lifetime until a transport change.
+func (m *Manager) beginOutput(q playbackRequest) {
+	m.mu.Lock()
+	r := m.accounts[q.id]
+	if r == nil || r != q.account || r.generation != q.generation || r.intent.revision != q.intent || r.intent.joinRevision != q.joinRevision || !r.intent.wantPlay {
+		m.mu.Unlock()
+		return
+	}
+	if r.intent.joinContext == nil {
+		r.intent.joinContext, r.intent.joinCancel = context.WithCancel(m.ctx)
+	}
+	ctx := r.intent.joinContext
+	m.mu.Unlock()
+	if group, ok := m.output.(interface{ BeginWithContext(context.Context) }); ok {
+		group.BeginWithContext(ctx)
+	} else {
+		m.output.Begin()
 	}
 }
 
@@ -53,6 +91,8 @@ func (m *Manager) observePlaybackEvent(e event) event {
 		return e
 	}
 	switch e.spotify.Type {
+	case "will_play", "seek":
+		invalidateJoin(r)
 	case "paused":
 		// The pinned engine emits one paused event per pause command, even
 		// when already paused. Consume exactly one acknowledgement, before
@@ -71,6 +111,7 @@ func (m *Manager) observePlaybackEvent(e event) event {
 		invalidateIntent(r, true)
 	}
 	e.intent = r.intent.revision
+	e.joinRevision = r.intent.joinRevision
 	return e
 }
 
@@ -97,6 +138,7 @@ func (m *Manager) playbackRequest(id string) playbackRequest {
 	q := playbackRequest{id: id, account: r, target: m.store.Snapshot().Settings.TargetID}
 	if r != nil {
 		q.player, q.generation, q.intent = r.player, r.generation, r.intent.revision
+		q.joinRevision = r.intent.joinRevision
 	}
 	return q
 }
