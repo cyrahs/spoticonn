@@ -59,8 +59,8 @@ func TestDownloadArtworkValidatesAndConvertsImages(t *testing.T) {
 			if _, err := jpeg.Decode(bytes.NewReader(got)); err != nil {
 				t.Fatal("not an MRP-compatible JPEG", err)
 			}
-			if format == "jpeg" && !bytes.Equal(got, data) {
-				t.Fatal("unnecessarily changed JPEG bytes")
+			if !bytes.Contains(got, []byte{0xff, 0xc0}) || bytes.Contains(got, []byte{0xff, 0xc2}) {
+				t.Fatal("not a baseline JPEG")
 			}
 		})
 	}
@@ -287,4 +287,39 @@ func TestArtworkCacheCancelsUnneededDownloadWithoutPoisoningNewRequest(t *testin
 		t.Fatal("cancelled request reused", err)
 	}
 	close(finish)
+}
+
+func TestArtworkFlattensTransparencyAndBoundsDimensions(t *testing.T) {
+	for _, size := range []image.Point{{1024, 512}, {512, 1024}, {20, 10}} {
+		img := image.NewNRGBA(image.Rect(0, 0, size.X, size.Y))
+		for y := size.Y / 2; y < size.Y; y++ {
+			for x := 0; x < size.X; x++ {
+				img.SetNRGBA(x, y, color.NRGBA{R: 255, A: 128})
+			}
+		}
+		var input bytes.Buffer
+		if err := png.Encode(&input, img); err != nil {
+			t.Fatal(err)
+		}
+		data, err := downloadArtwork(t.Context(), artworkResponseClient(200, "image/png", input.Bytes(), -1), "https://cover.example/image")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := jpeg.Decode(bytes.NewReader(data))
+		if err != nil || len(data) > artworkMaxBytes {
+			t.Fatal("invalid output JPEG", err)
+		}
+		w, h := got.Bounds().Dx(), got.Bounds().Dy()
+		if w > artworkSize || h > artworkSize || w*size.Y != h*size.X {
+			t.Fatal("incorrect resized dimensions", got.Bounds())
+		}
+		r, g, b, _ := got.At(w/2, 0).RGBA()
+		if r < 0xf000 || g < 0xf000 || b < 0xf000 {
+			t.Fatal("transparent region was not flattened to white", r, g, b)
+		}
+		r, g, b, _ = got.At(w/2, h-1).RGBA()
+		if r < 0xf000 || g < 0x7000 || g > 0x9000 || b < 0x7000 || b > 0x9000 {
+			t.Fatal("partial transparency was not composited on white", r, g, b)
+		}
+	}
 }

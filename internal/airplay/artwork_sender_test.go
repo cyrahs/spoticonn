@@ -19,7 +19,11 @@ import (
 func artworkPaths(trace string) []string {
 	var paths []string
 	for _, line := range strings.Split(trace, "\n") {
-		if path, ok := strings.CutPrefix(line, "ARTWORKFILE="); ok && path != "" {
+		path, ok := strings.CutPrefix(line, "ARTWORKFILE=")
+		if !ok {
+			path, ok = strings.CutPrefix(line, "ARTWORK=")
+		}
+		if ok && path != "" {
 			paths = append(paths, path)
 		}
 	}
@@ -65,13 +69,13 @@ func TestSenderArtworkUsesImmutableFilesAndAvoidsRepeatedWork(t *testing.T) {
 	if strings.Contains(commands(), "token=private") || strings.Contains(commands(), "\nACTION=STOP\n") {
 		t.Fatal("URL or command injection reached the FIFO")
 	}
-	// A new item on the same album gets the cached bytes, in a different,
-	// immutable file. The old command can never read the new item's file.
+	// A new item on the same album bundles the same immutable image.
+	// No file rewrite or download is necessary.
 	track.URI = "next-track"
 	_ = s.Metadata(track)
 	waitArtwork(t, s)
 	paths = artworkPaths(commands())
-	if len(paths) != 2 || paths[0] == paths[1] || calls.Load() != 1 {
+	if len(paths) != 2 || paths[0] != paths[1] || calls.Load() != 1 {
 		t.Fatal("track update did not reuse cache safely", paths)
 	}
 	s.Close()
@@ -126,7 +130,7 @@ func TestSenderArtworkDropsSupersededDownloadsAndUsesLatestPosition(t *testing.T
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatal("old image replaced current image", err)
 	}
-	if !strings.HasSuffix(before, "TITLE=latest\nARTIST=artist\nALBUM=\nITEMID=new-track\nDURATION=0\nPROGRESS=9\nARTWORKFILE="+paths[0]+"\nACTION=SENDMETA\n") {
+	if !strings.Contains(before, "TITLE=latest\nARTIST=artist\nALBUM=\nITEMID=new-track\nDURATION=0\nACTION=SENDMETA\nDURATION=0\nPROGRESS=9\n") || !strings.HasSuffix(before, "ARTWORK="+paths[0]+"\n") {
 		t.Fatal("download reverted refined metadata", before)
 	}
 }
@@ -173,8 +177,8 @@ func TestSenderArtworkFailureAndMissingCoverKeepControlsUsable(t *testing.T) {
 			}
 			track.Cover = ""
 			_ = s.Metadata(track)
-			if !missing && !strings.HasSuffix(commands(), "ARTWORK=\n") {
-				t.Fatal("same-item missing cover did not clear retained MRP artwork")
+			if strings.Contains(commands(), "ARTWORK=\n") {
+				t.Fatal("cleared artwork that was never delivered")
 			}
 		})
 	}
@@ -212,8 +216,8 @@ func TestSenderNoCoverAndShutdownCancelPendingArtwork(t *testing.T) {
 			if len(artworkPaths(commands())) != 0 {
 				t.Fatal("cancelled download published artwork")
 			}
-			if (action == "nil" || action == "no_cover") && !strings.Contains(commands(), "ARTWORK=\n") {
-				t.Fatal("cover was not cleared")
+			if strings.Contains(commands(), "ARTWORK=\n") {
+				t.Fatal("cleared artwork that was never delivered")
 			}
 		})
 	}
@@ -244,18 +248,39 @@ func TestSenderArtworkSendFailureIsDiagnosticOnly(t *testing.T) {
 	waitArtwork(t, s)
 }
 
-func TestSenderArtworkFilesStayBounded(t *testing.T) {
+func TestSenderArtworkFilesSurviveUntilChildExit(t *testing.T) {
 	data := testArtwork(t, "jpeg")
 	s, commands, _ := controlSender(t, 30)
-	s.artworkCache, s.runtimeDir = newArtworkCache(func(context.Context, string) ([]byte, error) { return data, nil }), t.TempDir()
+	s.artworkCache, s.runtimeDir = newArtworkCache(func(_ context.Context, source string) ([]byte, error) {
+		// Distinct valid JPEGs with a small COM marker; alias-0 has the same
+		// bytes as 0 even after the in-memory download cache evicts it.
+		comment := strings.TrimPrefix(source, "alias-")
+		result := append([]byte{}, data[:2]...)
+		result = append(result, 0xff, 0xfe, 0, byte(len(comment)+2))
+		result = append(result, comment...)
+		return append(result, data[2:]...), nil
+	}), t.TempDir()
 	for i := 0; i < artworkCacheEntries+3; i++ {
-		_ = s.Metadata(&model.Track{URI: fmt.Sprint(i), Cover: "cover"})
+		_ = s.Metadata(&model.Track{URI: fmt.Sprint(i), Cover: fmt.Sprint(i)})
 		waitArtwork(t, s)
 	}
+	_ = s.Metadata(&model.Track{URI: "alias", Cover: "alias-0"})
 	paths := artworkPaths(commands())
-	eventually(t, func() bool { files, _ := os.ReadDir(filepath.Dir(paths[0])); return len(files) == artworkCacheEntries })
+	files, _ := os.ReadDir(filepath.Dir(paths[0]))
+	if len(files) != artworkCacheEntries+3 || paths[0] != paths[len(paths)-1] {
+		t.Fatal("identical image bytes were not deduplicated", len(files))
+	}
+	for _, path := range paths {
+		if _, err := os.ReadFile(path); err != nil {
+			t.Fatal("deleted a path before the child consumed it", err)
+		}
+	}
 	if _, err := os.Stat(paths[len(paths)-1]); err != nil {
 		t.Fatal("removed current artwork", err)
+	}
+	s.Close()
+	if _, err := os.Stat(filepath.Dir(paths[0])); !os.IsNotExist(err) {
+		t.Fatal("process artwork files survived shutdown", err)
 	}
 }
 
@@ -267,7 +292,7 @@ func TestArtworkRuntimePathCannotInjectCommands(t *testing.T) {
 	if err := os.Mkdir(s.runtimeDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	diagnostics := make(chan string, 1)
+	diagnostics := make(chan string, 8)
 	s.diagnostic = func(v string) { diagnostics <- v }
 	_ = s.Metadata(&model.Track{URI: "track", Cover: "cover"})
 	select {
@@ -340,7 +365,7 @@ func TestArtworkSubprocessPCMResumeAndReconnect(t *testing.T) {
 		if attempt == 0 {
 			close(release)
 		}
-		waitForEngineCommands(t, commandLog, loaded, attempt*2+1)
+		waitForEngineCommands(t, commandLog, loaded, attempt+1)
 		ctx, cancel = context.WithTimeout(t.Context(), time.Second)
 		err = s.Flush(ctx)
 		cancel()
@@ -355,7 +380,11 @@ func TestArtworkSubprocessPCMResumeAndReconnect(t *testing.T) {
 		if err = s.Write(make([]byte, 1764)); err != nil {
 			t.Fatal(err)
 		}
-		trace := waitForEngineCommands(t, commandLog, loaded, attempt*2+2)
+		_ = s.Volume(42)
+		trace := waitForEngineCommands(t, commandLog, "VOLUME=42\n", attempt+1)
+		if strings.Count(trace, loaded) != attempt+1 || strings.Count(trace, "ACTION=SENDMETA\n") != attempt+1 {
+			t.Fatal("warm resume resent metadata/artwork", trace)
+		}
 		if strings.Contains(trace, "ARTWORK_LOAD_FAILED") {
 			t.Fatal("child could not read artwork", trace)
 		}
@@ -430,5 +459,178 @@ func TestGroupLateJoinReceivesCachedCurrentArtwork(t *testing.T) {
 				t.Fatal("group volume/progress resent artwork")
 			}
 		})
+	}
+}
+
+func TestArtworkBundlesBeforeStartAndProgressNeverReplaces(t *testing.T) {
+	data := testArtwork(t, "jpeg")
+	cache := newArtworkCache(func(context.Context, string) ([]byte, error) { return data, nil })
+	for _, warm := range []bool{false, true} {
+		t.Run(fmt.Sprint(warm), func(t *testing.T) {
+			if warm {
+				_, _ = cache.get(t.Context(), "cover")
+			}
+			s, commands, _ := controlSender(t, 30)
+			s.artworkCache, s.runtimeDir = cache, t.TempDir()
+			track := &model.Track{URI: "track", Cover: "cover", Name: "title", Position: 9000, Duration: 120000}
+			if err := s.Metadata(track); err != nil {
+				t.Fatal(err)
+			}
+			startSender(s)
+			trace := commands()
+			paths := artworkPaths(trace)
+			if len(paths) != 1 || strings.Count(trace, "ACTION=SENDMETA\n") != 1 || strings.Contains(trace, "ARTWORK=\n") {
+				t.Fatal("initial metadata was not bundled", trace)
+			}
+			if !strings.Contains(trace, "ARTWORKFILE="+paths[0]+"\nACTION=SENDMETA\nDURATION=120\nPROGRESS=9\nSTART_UNIX_MS=0\nACTION=START\n") {
+				t.Fatal("incorrect bundle/progress/start order", trace)
+			}
+			for i := 0; i < 20; i++ {
+				track.Position += 1000
+				_ = s.Metadata(track)
+			}
+			track.Duration += 1000
+			_ = s.Metadata(track)
+			if strings.Count(commands(), "ACTION=SENDMETA\n") != 1 || len(artworkPaths(commands())) != 1 {
+				t.Fatal("progress/duration rebuilt the media card", commands())
+			}
+			before := commands()
+			_ = s.Metadata(track)
+			if commands() != before {
+				t.Fatal("identical progress was not deduplicated")
+			}
+		})
+	}
+}
+
+func TestArtworkStartInterruptsBundleWait(t *testing.T) {
+	for _, join := range []bool{false, true} {
+		t.Run(fmt.Sprint(join), func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			data := testArtwork(t, "jpeg")
+			cache := newArtworkCache(func(ctx context.Context, _ string) ([]byte, error) {
+				close(started)
+				select {
+				case <-release:
+					return data, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			})
+			s, commands, _ := controlSender(t, 30)
+			s.artworkCache, s.runtimeDir = cache, t.TempDir()
+			metadataDone := make(chan error, 1)
+			go func() { metadataDone <- s.Metadata(&model.Track{URI: "track", Cover: "cover"}) }()
+			<-started
+			if join {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				go func() { _, _ = s.Join(ctx, 12345) }()
+			} else {
+				startSender(s)
+			}
+			select {
+			case err := <-metadataDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("START did not interrupt the bundle wait")
+			}
+			trace := commands()
+			if strings.Index(trace, "ACTION=SENDMETA\n") < 0 || strings.Index(trace, "ACTION=SENDMETA\n") > strings.Index(trace, "ACTION=START\n") {
+				t.Fatal("START preceded text metadata", trace)
+			}
+			close(release)
+			waitArtwork(t, s)
+			trace = commands()
+			if strings.Count(trace, "ACTION=SENDMETA\n") != 1 || strings.Contains(trace, "ARTWORKFILE=") || len(artworkPaths(trace)) != 1 || !strings.Contains(trace, "\nARTWORK=") {
+				t.Fatal("slow artwork resent the full metadata", trace)
+			}
+		})
+	}
+}
+
+func TestArtworkReplacementAndFailureClearOnlyRetainedImage(t *testing.T) {
+	for _, next := range []string{"new-cover", "failed", ""} {
+		t.Run(next, func(t *testing.T) {
+			data := testArtwork(t, "jpeg")
+			cache := newArtworkCache(func(_ context.Context, source string) ([]byte, error) {
+				if source == "failed" {
+					return nil, errors.New("封面下载失败或超时")
+				}
+				return data, nil
+			})
+			s, commands, _ := controlSender(t, 30)
+			s.artworkCache, s.runtimeDir = cache, t.TempDir()
+			track := &model.Track{URI: "track", Cover: "old-cover"}
+			_ = s.Metadata(track)
+			before := commands()
+			track.Cover = next
+			_ = s.Metadata(track)
+			waitArtwork(t, s)
+			delta := strings.TrimPrefix(commands(), before)
+			if strings.Contains(delta, "SENDMETA") {
+				t.Fatal("same-item cover change resent text", delta)
+			}
+			if next == "new-cover" {
+				if len(artworkPaths(delta)) != 1 || strings.Contains(delta, "ARTWORK=\n") {
+					t.Fatal("replacement cleared the ready image", delta)
+				}
+			} else if delta != "ARTWORK=\n" {
+				t.Fatal("missing/failed cover did not clear old artwork exactly once", delta)
+			}
+			before = commands()
+			_ = s.Metadata(track)
+			if commands() != before {
+				t.Fatal("unchanged cover repeated commands")
+			}
+		})
+	}
+}
+
+func TestArtworkFIFOFailureDoesNotCommitDeliveryIdentity(t *testing.T) {
+	data := testArtwork(t, "jpeg")
+	s, commands, _ := controlSender(t, 30)
+	s.artworkCache, s.runtimeDir = newArtworkCache(func(context.Context, string) ([]byte, error) { return data, nil }), t.TempDir()
+	fd := s.cmdFD
+	s.cmdFD = -1
+	track := &model.Track{URI: "track", Cover: "cover"}
+	if s.Metadata(track) == nil {
+		t.Fatal("failed metadata write reported success")
+	}
+	s.mu.Lock()
+	if s.artwork.textSet || s.artwork.cover != "" {
+		t.Error("failed write committed delivery state")
+	}
+	s.cmdFD = fd
+	s.mu.Unlock()
+	if err := s.Metadata(track); err != nil {
+		t.Fatal(err)
+	}
+	if len(artworkPaths(commands())) != 1 || strings.Count(commands(), "ACTION=SENDMETA\n") != 1 {
+		t.Fatal("failed delivery did not retry the prepared bundle", commands())
+	}
+}
+
+func TestArtworkStopInterruptsBundleWait(t *testing.T) {
+	started := make(chan struct{})
+	s, commands, _ := controlSender(t, 30)
+	s.artworkCache = newArtworkCache(func(ctx context.Context, _ string) ([]byte, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	done := make(chan error, 1)
+	go func() { done <- s.Metadata(&model.Track{URI: "track", Cover: "cover"}) }()
+	<-started
+	_ = s.Standby()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("standby did not interrupt metadata wait")
+	}
+	if commands() != "ACTION=STANDBY\n" {
+		t.Fatal("stopped metadata escaped its generation", commands())
 	}
 }

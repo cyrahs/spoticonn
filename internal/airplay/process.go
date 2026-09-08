@@ -56,6 +56,7 @@ type Sender struct {
 	status         func(string)
 	remoteControl  func(RemoteCommand)
 	deviceID       string
+	deviceKind     string
 	diagnostic     func(string)
 	runtimeDir     string
 	artworkCache   *ArtworkCache
@@ -119,6 +120,13 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	cmd.WaitDelay = 2 * time.Second
 	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status, failed: make(chan struct{}), sharedPTP: cfg.SharedPTP, startConfirmed: make(chan struct{})}
 	s.remoteControl, s.deviceID = cfg.RemoteControl, d.ID
+	s.deviceKind = "AirPlay"
+	switch {
+	case strings.HasPrefix(strings.ToLower(d.Model), "appletv"):
+		s.deviceKind = "AppleTV"
+	case strings.HasPrefix(strings.ToLower(d.Model), "audioaccessory"):
+		s.deviceKind = "HomePod"
+	}
 	s.diagnostic, s.runtimeDir, s.artworkCache = cfg.Diagnostic, cfg.RuntimeDir, cfg.Artwork
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -238,7 +246,10 @@ func (s *Sender) scan(r io.Reader) {
 			if s.pendingStart && !s.closed {
 				s.cancelStartLocked()
 				s.prepareStartLocked(false)
-				err = s.commandLocked("START_UNIX_MS=0\nACTION=START\n")
+				err = s.flushMetadataLocked()
+				if err == nil {
+					err = s.commandLocked("START_UNIX_MS=0\nACTION=START\n")
+				}
 				if err == nil {
 					s.startAcks = append(s.startAcks, s.startEpoch)
 				}
@@ -258,12 +269,9 @@ func (s *Sender) scan(r io.Reader) {
 				s.flushed = nil
 			}
 			s.mu.Unlock()
-		case strings.HasPrefix(line, "mrp artwork=rejected "):
-			// Fixed text only: engine output can contain paths or remote data.
-			s.artworkDiagnostic("引擎已省略或清除封面")
-		case strings.HasPrefix(line, "mrp artwork=posted "):
-			if !strings.Contains(line, " status=200 ") {
-				s.artworkDiagnostic("接收端未确认封面")
+		case strings.HasPrefix(line, "mrp "):
+			if message := artworkStatusDiagnostic(line); message != "" {
+				s.artworkDiagnostic(message)
 			}
 		case strings.HasPrefix(line, "error"):
 			// Only trust the structured error code; engine detail may contain secrets.
@@ -456,7 +464,10 @@ func (s *Sender) Join(ctx context.Context, at int64) (int64, error) {
 	}
 	s.cancelStartLocked()
 	s.prepareStartLocked(true)
-	err := s.commandLocked(fmt.Sprintf("START_UNIX_MS=%d\nSTART_JOIN=1\nACTION=START\n", at))
+	err := s.flushMetadataLocked()
+	if err == nil {
+		err = s.commandLocked(fmt.Sprintf("START_UNIX_MS=%d\nSTART_JOIN=1\nACTION=START\n", at))
+	}
 	if err == nil {
 		s.startAcks = append(s.startAcks, s.startEpoch)
 	}
