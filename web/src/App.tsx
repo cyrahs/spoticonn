@@ -31,6 +31,7 @@ import {
 } from 'lucide-react'
 import { api, APIError } from './api'
 import type { Account, Device, State } from './api'
+import DeviceAuthentication, { memberName } from './DeviceAuthentication'
 
 const accountStatus: Record<string, string> = {
   online: '已连接',
@@ -73,7 +74,7 @@ function deviceType(d: Device) {
 function deviceStatus(d: Device) {
   if (d.waiting_for_leader) return '等待主设备上线'
   if (!d.online) return '离线 · 等待重连'
-  return d.paired ? '已配对 · 在线' : '在线'
+  return !d.group && d.paired ? '已配对 · 在线' : '在线'
 }
 function DeviceSymbol({ device: d }: { device: Device }) {
   return (
@@ -261,6 +262,12 @@ export default function App() {
   const [label, setLabel] = useState('')
   const [name, setName] = useState('')
   const [pin, setPin] = useState('')
+  const [devicePassword, setDevicePassword] = useState('')
+  const [passwordTarget, setPasswordTarget] = useState<{
+    device_id: string
+    member_id: string
+    name: string
+  } | null>(null)
   const [remove, setRemove] = useState<Account | null>(null)
   const [volume, setVolume] = useState(30)
   const [seek, setSeek] = useState<number | null>(null)
@@ -344,6 +351,10 @@ export default function App() {
   const pinWaiting = state?.pairing?.status === 'waiting_pin'
   const pairingActive =
     !!state?.pairing && ['starting', 'waiting_pin', 'verifying'].includes(state.pairing.status)
+  const pairingMember = state?.devices
+    .flatMap((device) => (device.group ? device.members || [] : [device]))
+    .find((member) => member.id === state?.pairing?.device_id)
+  const pairingName = pairingMember ? memberName(pairingMember) : state?.pairing?.device_id
 
   if (loading)
     return (
@@ -756,38 +767,32 @@ export default function App() {
                                   : '通过组内主设备连接'}
                         </p>
                       )}
-                      {d.staged ? (
-                        d.members?.map((member) => (
-                          <button
-                            className="pair-button"
-                            key={member.id}
-                            disabled={busy || !member.online || pairingActive}
-                            onClick={() =>
-                              void action(() =>
-                                api('/airplay/pairings', 'POST', {
-                                  device_id: d.id,
-                                  member_id: member.id,
-                                }),
-                              )
-                            }
-                          >
-                            {member.paired ? '重新配对' : '配对'}{' '}
-                            {isHomePod(member.model) ? 'HomePod' : 'Apple TV'}
-                            <ChevronRight size={13} />
-                          </button>
-                        ))
-                      ) : (
-                        <button
-                          className="pair-button"
-                          disabled={busy || !d.online || pairingActive}
-                          onClick={() =>
-                            void action(() => api('/airplay/pairings', 'POST', { device_id: d.id }))
-                          }
-                        >
-                          {d.paired ? '重新配对' : '输入配对码连接'}
-                          <ChevronRight size={13} />
-                        </button>
-                      )}
+                      {(d.group && d.members?.length ? d.members : [d]).map((member) => (
+                        <DeviceAuthentication
+                          key={member.id}
+                          member={member}
+                          disabled={busy || !member.online || pairingActive}
+                          manageable={!!d.staged || (member.id === d.id && !d.waiting_for_leader)}
+                          pair={() => {
+                            setPin('')
+                            void action(() =>
+                              api('/airplay/pairings', 'POST', {
+                                device_id: d.id,
+                                member_id: member.id,
+                              }),
+                            )
+                          }}
+                          password={() => {
+                            setError('')
+                            setDevicePassword('')
+                            setPasswordTarget({
+                              device_id: d.id,
+                              member_id: member.id,
+                              name: memberName(member),
+                            })
+                          }}
+                        />
+                      ))}
                     </div>
                   ))
                 )}
@@ -1004,13 +1009,17 @@ export default function App() {
               <strong>选择家中的 AirPlay 设备</strong>
               <p>
                 让 home 与 Apple TV 位于同一局域网，将 HomePod 设为 Apple TV
-                的默认音频输出。发现同组设备后会自动合并。两成员组合可分别配对，选择一次即可按
+                的默认音频输出。发现同组设备后会自动合并。两成员组合分别显示认证状态，选择一次即可按
                 HomePod 优先的顺序启动。
               </p>
             </li>
             <li>
               <strong>按需输入配对码</strong>
-              <p>首次配对可能需要打开电视查看四位码。完成配对后，日常播放可再验证关电视状态。</p>
+              <p>
+                仅为明确要求屏幕 PIN 的成员配对，Apple TV 的配对码显示在电视上。密码保护设备使用
+                AirPlay 设备密码；可直接播放的 HomePod
+                无需额外配对。未知状态可先播放，失败后查看高级认证选项和设备访问设置。
+              </p>
             </li>
             <li>
               <strong>添加每个 Premium 账号</strong>
@@ -1029,9 +1038,58 @@ export default function App() {
           </p>
         </Modal>
       )}
+      {passwordTarget && (
+        <Modal
+          title={`设备密码 · ${passwordTarget.name}`}
+          close={() => {
+            setPasswordTarget(null)
+            setDevicePassword('')
+          }}
+        >
+          <p className="modal-intro">
+            输入为该成员设置的 AirPlay
+            密码。保存后在下次连接时验证，请尝试播放；保存成功不代表认证已通过。
+          </p>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              const value = devicePassword
+              setDevicePassword('')
+              void action(async () => {
+                await api('/airplay/passwords', 'POST', {
+                  device_id: passwordTarget.device_id,
+                  member_id: passwordTarget.member_id,
+                  password: value,
+                })
+                setPasswordTarget(null)
+              })
+            }}
+          >
+            <label htmlFor="device-password">AirPlay 设备密码</label>
+            <input
+              id="device-password"
+              type="password"
+              autoComplete="off"
+              autoFocus
+              required
+              maxLength={256}
+              value={devicePassword}
+              onChange={(event) => setDevicePassword(event.target.value)}
+            />
+            <button className="primary full" disabled={busy || !devicePassword}>
+              保存设备密码
+            </button>
+          </form>
+          {error && (
+            <p className="error-text" role="alert">
+              {error}
+            </p>
+          )}
+        </Modal>
+      )}
       {pairingActive && state.pairing && (
         <Modal
-          title="连接 AirPlay 设备"
+          title={`连接 ${pairingName}`}
           close={() =>
             void action(async () => {
               await api(`/airplay/pairings/${state.pairing!.id}/cancel`, 'POST')
@@ -1086,7 +1144,7 @@ export default function App() {
       )}
       {state.pairing?.error && (
         <div className="pairing-toast" role="status">
-          {state.pairing.error}
+          {pairingName}：{state.pairing.error}
         </div>
       )}
       {remove && (

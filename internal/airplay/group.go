@@ -85,7 +85,7 @@ func OpenHomeTheater(ctx context.Context, cfg Config, target Target, pairings ma
 		if clock != nil {
 			clock.Close()
 		}
-		return nil, err
+		return nil, fmt.Errorf("HomePod（%s）：%w", displayName(pod.Name), err)
 	}
 	g.primary = primary
 	if clock != nil && clock.done != nil {
@@ -197,7 +197,11 @@ stable:
 	})
 	if err != nil {
 		if c.ctx.Err() == nil {
-			g.report("group_degraded_connect")
+			if errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrAuthFailed) {
+				g.report("group_degraded_auth")
+			} else {
+				g.report("group_degraded_connect")
+			}
 		}
 		return
 	}

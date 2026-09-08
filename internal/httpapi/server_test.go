@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"spoticonn/internal/bridge"
@@ -23,6 +24,7 @@ func testHandler(t *testing.T) http.Handler {
 	}
 	_ = s.Update(func(v *store.State) error {
 		v.Pairings["tv"] = model.PairingSecret{Credentials: "SECRET-PAIRING-KEY"}
+		v.Devices["pod"] = model.Device{ID: "pod", Name: "HomePod", Model: "AudioAccessory6,1", Online: true, LastSeen: time.Now(), TXT: map[string]string{"pw": "true"}}
 		return nil
 	})
 	m := bridge.New(context.Background(), s, bridge.Config{DisableDiscovery: true})
@@ -32,6 +34,36 @@ func testHandler(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	return h
+}
+
+func TestDevicePasswordEndpointRequiresSessionAndRedactsSavedSecret(t *testing.T) {
+	h := testHandler(t)
+	body := `{"device_id":"pod","member_id":"pod","password":"SECRET-DEVICE-PASSWORD"}`
+	if w := request(h, "POST", "/api/airplay/passwords", body, nil, ""); w.Code != 401 {
+		t.Fatal("unauthenticated password mutation accepted")
+	}
+	cookie := login(t, h)
+	if w := request(h, "POST", "/api/airplay/passwords", body, cookie, "https://attacker.example"); w.Code != 403 {
+		t.Fatal("cross-origin password mutation accepted")
+	}
+	if w := request(h, "POST", "/api/airplay/passwords", body, cookie, ""); w.Code != 200 || strings.Contains(w.Body.String(), "SECRET") {
+		t.Fatalf("password was not saved safely: %d", w.Code)
+	}
+	w := request(h, "GET", "/api/state", "", cookie, "")
+	var state model.Snapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Devices) != 1 || state.Devices[0].Paired || !state.Devices[0].Authentication.PasswordSaved {
+		t.Fatal("password save was reported as a PIN pairing")
+	}
+	if strings.Contains(w.Body.String(), "SECRET") {
+		t.Fatal("snapshot exposed a saved secret")
+	}
+	w = request(h, "POST", "/api/airplay/pairings", `{"device_id":"pod"}`, cookie, "")
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "设备密码") {
+		t.Fatal("password-protected device was offered a PIN flow")
+	}
 }
 func request(h http.Handler, method, path, body string, cookie *http.Cookie, origin string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))

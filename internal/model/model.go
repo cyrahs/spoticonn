@@ -33,6 +33,7 @@ type Device struct {
 // remain keyed by physical device ID, even when several devices share a group.
 type DeviceView struct {
 	Device
+	Authentication   Authentication `json:"authentication"`
 	Group            bool           `json:"group,omitempty"`
 	Staged           bool           `json:"staged,omitempty"`
 	AudioDeviceID    string         `json:"audio_device_id,omitempty"`
@@ -42,16 +43,25 @@ type DeviceView struct {
 }
 
 type DeviceMember struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Model  string `json:"model"`
-	Online bool   `json:"online"`
-	Paired bool   `json:"paired"`
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Model          string         `json:"model"`
+	Online         bool           `json:"online"`
+	Paired         bool           `json:"paired"`
+	Authentication Authentication `json:"authentication"`
+}
+
+// Authentication reports advertised requirements separately from saved secrets.
+// Unknown is intentional: missing discovery data is not evidence of open access.
+type Authentication struct {
+	Requirement   string `json:"requirement"`
+	PasswordSaved bool   `json:"password_saved"`
 }
 
 type PairingSecret struct {
 	DACP        string `json:"dacp"`
 	Credentials string `json:"credentials"`
+	Password    string `json:"password,omitempty"`
 }
 
 type Track struct {

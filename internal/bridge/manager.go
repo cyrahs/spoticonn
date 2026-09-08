@@ -1167,39 +1167,19 @@ func (m *Manager) StartPairing(deviceID string) (model.PairingView, error) {
 func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingView, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
+	target, d, err := m.authenticationMember(deviceID, memberID)
+	if err != nil {
+		return model.PairingView{}, err
+	}
+	switch airplay.Authentication(d, m.store.Snapshot().Pairings[d.ID]).Requirement {
+	case "password":
+		return model.PairingView{}, errors.New("此设备要求 AirPlay 密码，请保存设备密码后尝试播放，无需输入四位配对码")
+	case "access_control":
+		return model.PairingView{}, errors.New("设备限制了家庭访问权限，请先在家庭 App 或设备上检查 AirPlay 访问设置")
+	}
 	m.mu.Lock()
-	target, exists := airplay.ResolveTarget(m.devices, deviceID, time.Now())
 	busy := m.pairingView != nil && (m.pairingView.Status == "starting" || m.pairingView.Status == "waiting_pin" || m.pairingView.Status == "verifying")
 	m.mu.Unlock()
-	if !exists {
-		return model.PairingView{}, errors.New("设备不存在")
-	}
-	d := target.Device
-	if pod, _, staged := target.HomeTheater(); staged {
-		d = pod
-		if memberID != "" {
-			found := false
-			for _, member := range target.Members {
-				if member.ID == memberID {
-					d = member
-					found = true
-				}
-			}
-			if !found {
-				return model.PairingView{}, errors.New("配对成员不属于所选组合")
-			}
-		}
-		if !d.Online {
-			return model.PairingView{}, errors.New("配对成员尚未上线")
-		}
-	} else {
-		if memberID != "" && memberID != d.ID {
-			return model.PairingView{}, errors.New("此目标不支持独立成员配对")
-		}
-		if err := target.Ready(); err != nil {
-			return model.PairingView{}, err
-		}
-	}
 	deviceID = d.ID
 	if busy {
 		return model.PairingView{}, errors.New("已有配对正在进行")
@@ -1228,7 +1208,9 @@ func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingVi
 		}
 		if err == nil {
 			err = m.store.Update(func(s *store.State) error {
-				s.Pairings[deviceID] = model.PairingSecret{DACP: dacp, Credentials: credentials}
+				secret := s.Pairings[deviceID]
+				secret.DACP, secret.Credentials = dacp, credentials
+				s.Pairings[deviceID] = secret
 				for _, member := range target.Members {
 					s.Devices[member.ID] = member
 				}
@@ -1239,7 +1221,7 @@ func (m *Manager) StartMemberPairing(deviceID, memberID string) (model.PairingVi
 		if m.pairingView != nil && m.pairingView.ID == v.ID && m.pairingView.Status != "cancelled" {
 			if err != nil {
 				m.pairingView.Status = "error"
-				m.pairingView.Error = "配对失败，请检查配对码和设备连接"
+				m.pairingView.Error = "配对失败：请确认该成员支持屏幕 PIN，检查配对码、AirPlay 访问设置及网络；可直接播放的设备无需额外配对"
 			} else {
 				m.pairingView.Status = "paired"
 			}
