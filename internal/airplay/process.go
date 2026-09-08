@@ -23,6 +23,7 @@ import (
 type Config struct {
 	Binary, RuntimeDir, InterfaceIP string
 	SharedPTP                       bool
+	RemoteControl                   func(RemoteCommand) // must not block the engine reader
 }
 type Sender struct {
 	id             string
@@ -50,6 +51,8 @@ type Sender struct {
 	volumeTimer    *time.Timer
 	flushed        chan struct{}
 	status         func(string)
+	remoteControl  func(RemoteCommand)
+	deviceID       string
 }
 
 func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSecret, volume, rate int, status func(string)) (*Sender, error) {
@@ -102,6 +105,7 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	}
 	cmd.WaitDelay = 2 * time.Second
 	s := &Sender{id: store.ID(8), input: w, cmdFD: fd, ctx: child, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), volume: volume, status: status, failed: make(chan struct{}), sharedPTP: cfg.SharedPTP, startConfirmed: make(chan struct{})}
+	s.remoteControl, s.deviceID = cfg.RemoteControl, d.ID
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -136,6 +140,8 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	go func() {
 		scans.Wait()
 		_ = cmd.Wait()
+		unexpected := child.Err() == nil
+		cancel() // invalidate queued controls even on an unexpected process exit
 		_ = w.Close()
 		s.mu.Lock()
 		s.closed = true
@@ -144,7 +150,7 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		close(s.done)
 		s.mu.Unlock()
 		_ = os.Remove(cmdPath)
-		if child.Err() == nil {
+		if unexpected {
 			s.status("disconnected")
 		}
 	}()
@@ -177,6 +183,12 @@ func (s *Sender) scan(r io.Reader) {
 	scanner.Buffer(make([]byte, 4096), 256<<10)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if action := remoteAction(line); action != "" {
+			if s.remoteControl != nil && s.ctx.Err() == nil {
+				s.remoteControl(RemoteCommand{Context: s.ctx, DeviceID: s.deviceID, Action: action, ReceivedAt: time.Now()})
+			}
+			continue
+		}
 		i := strings.Index(line, "[STATUS] ")
 		if i < 0 {
 			continue

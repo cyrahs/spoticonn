@@ -248,6 +248,10 @@ func TestAirPlayEngineProcess(t *testing.T) {
 			fmt.Fprintln(commandLog, sc.Text())
 		}
 		switch sc.Text() {
+		case "ACTION=SENDMETA":
+			if event := os.Getenv("SPOTICONN_TEST_AIRPLAY_REMOTE"); event != "" {
+				fmt.Fprintln(os.Stdout, event)
+			}
 		case "START_JOIN=1":
 			join = true
 		case "ACTION=START":
