@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import App from './App'
 import type { State } from './api'
@@ -231,12 +231,24 @@ const livingRoom: State['devices'][number] = {
   audio_device_id: 'pod',
   join_device_id: 'tv',
   members: [
-    { id: 'tv', name: 'Living Room', model: 'AppleTV14,1', online: true },
-    { id: 'pod', name: 'Living Room (2)', model: 'AudioAccessory6,1', online: true },
+    {
+      id: 'tv',
+      name: 'Living Room',
+      model: 'AppleTV14,1',
+      online: true,
+      authentication: { requirement: 'pin', password_saved: false },
+    },
+    {
+      id: 'pod',
+      name: 'Living Room (2)',
+      model: 'AudioAccessory6,1',
+      online: true,
+      authentication: { requirement: 'none', password_saved: false },
+    },
   ],
 }
 
-it('shows one staged output and pairs each physical member', async () => {
+it('offers PIN pairing only for the member requiring it while keeping the group selectable', async () => {
   const state: State = structuredClone(empty)
   state.devices = [structuredClone(livingRoom)]
   const fetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
@@ -261,17 +273,11 @@ it('shows one staged output and pairs each physical member', async () => {
       body: JSON.stringify({ ...empty.settings, target_id: 'tv' }),
     }),
   )
-  await user.click(screen.getByRole('button', { name: '配对 HomePod' }))
-  await waitFor(() =>
-    expect(fetch).toHaveBeenCalledWith(
-      '/api/airplay/pairings',
-      expect.objectContaining({
-        method: 'POST',
-        body: JSON.stringify({ device_id: 'tv', member_id: 'pod' }),
-      }),
-    ),
-  )
-  await user.click(screen.getByRole('button', { name: '配对 Apple TV' }))
+  const pod = screen.getByRole('region', { name: 'Living Room (2) · HomePod 认证' })
+  expect(within(pod).getByText(/无需额外配对/)).toBeDefined()
+  expect(pod.querySelector('details')?.open).toBe(false)
+  expect(pod.querySelectorAll(':scope > button')).toHaveLength(0)
+  await user.click(screen.getByRole('button', { name: '配对 Living Room · Apple TV' }))
   await waitFor(() =>
     expect(fetch).toHaveBeenCalledWith(
       '/api/airplay/pairings',
@@ -300,9 +306,8 @@ it('keeps the saved group selected and disables connection while its leader is u
   expect(target.disabled).toBe(true)
   expect(target.getAttribute('aria-pressed')).toBe('true')
   expect(screen.getByText('等待主设备上线')).toBeDefined()
-  expect(
-    (screen.getByRole('button', { name: '输入配对码连接' }) as HTMLButtonElement).disabled,
-  ).toBe(true)
+  expect(screen.getAllByText('此组合通过主设备管理认证。')).toHaveLength(2)
+  expect(screen.queryByRole('button', { name: /配对 Living Room/ })).toBeNull()
 })
 
 it('keeps a staged group selectable with an offline TV and shows its degradation', async () => {
@@ -322,10 +327,10 @@ it('keeps a staged group selectable with an offline TV and shows its degradation
   })) as HTMLButtonElement
   expect(target.disabled).toBe(false)
   expect(
-    (screen.getByRole('button', { name: '配对 Apple TV' }) as HTMLButtonElement).disabled,
+    (screen.getByRole('button', { name: '配对 Living Room · Apple TV' }) as HTMLButtonElement)
+      .disabled,
   ).toBe(true)
-  expect((screen.getByRole('button', { name: '配对 HomePod' }) as HTMLButtonElement).disabled).toBe(
-    false,
-  )
+  expect(screen.getByText(/无需额外配对/)).toBeDefined()
+  expect(screen.queryByRole('button', { name: '配对 HomePod' })).toBeNull()
   expect(screen.getByText('Apple TV 离线，HomePod 继续播放')).toBeDefined()
 })

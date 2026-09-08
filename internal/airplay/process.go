@@ -35,6 +35,7 @@ type Sender struct {
 	readyOnce      sync.Once
 	failed         chan struct{}
 	failOnce       sync.Once
+	connectError   error
 	sharedPTP      bool
 	startSent      bool
 	joinStart      bool
@@ -75,6 +76,12 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 	args := []string{"--protocol", "auto", "--port", strconv.Itoa(d.Port), "--volume", strconv.Itoa(volume), "--samplerate", strconv.Itoa(rate), "--channels", "2", "--bitdepth", "16", "--cmdpipe", cmdPath, "--name", "Spoticonn", "--debug", "1"}
 	if pair.Credentials != "" {
 		args = append(args, "--auth", pair.Credentials, "--dacp", pair.DACP)
+	}
+	if pair.Password != "" {
+		args = append(args, "--password", pair.Password)
+	}
+	if Authentication(d, pair).Requirement == "password" {
+		args = append(args, "--pw", "true")
 	}
 	if cfg.InterfaceIP != "" {
 		args = append(args, "--if", cfg.InterfaceIP)
@@ -159,10 +166,10 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		return s, nil
 	case <-s.failed:
 		s.Close()
-		return nil, errors.New("AirPlay 连接或共享时钟失败")
+		return nil, s.connectionError()
 	case <-s.done:
 		cancel()
-		return nil, errors.New("AirPlay 连接失败，请检查配对和网络")
+		return nil, s.connectionError()
 	case <-ctx.Done():
 		s.Close()
 		return nil, ctx.Err()
@@ -170,6 +177,15 @@ func Open(ctx context.Context, cfg Config, d model.Device, pair model.PairingSec
 		s.Close()
 		return nil, errors.New("AirPlay 连接或时钟同步超时，请检查 UDP 319/320")
 	}
+}
+
+func (s *Sender) connectionError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connectError != nil {
+		return s.connectError
+	}
+	return errors.New("AirPlay 连接失败，请检查设备认证、访问设置、网络及共享时钟")
 }
 
 func (s *Sender) scan(r io.Reader) {
@@ -223,6 +239,18 @@ func (s *Sender) scan(r io.Reader) {
 			}
 			s.mu.Unlock()
 		case strings.HasPrefix(line, "error"):
+			// Only trust the structured error code; engine detail may contain secrets.
+			fields := strings.Fields(line)
+			if len(fields) > 1 {
+				s.mu.Lock()
+				switch fields[1] {
+				case "code=auth_required":
+					s.connectError = ErrAuthRequired
+				case "code=auth_failed":
+					s.connectError = ErrAuthFailed
+				}
+				s.mu.Unlock()
+			}
 			s.failOnce.Do(func() { close(s.failed) })
 			s.cancelStart()
 			s.status("error")
