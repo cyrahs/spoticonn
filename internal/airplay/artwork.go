@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"image"
+	"image/color"
 	"image/jpeg"
 	_ "image/png"
 	"io"
@@ -23,6 +24,7 @@ const (
 	// cliairplay v0.5.3's MediaRemote staging guard is 1 MiB.
 	artworkMaxBytes     = 1 << 20
 	artworkCacheEntries = 8
+	artworkSize         = 512
 )
 
 // ArtworkCache shares bounded, in-memory downloads across group members and
@@ -251,17 +253,47 @@ func downloadArtwork(ctx context.Context, client *http.Client, source string) ([
 	if err != nil {
 		return nil, errors.New("封面图片损坏")
 	}
-	// MRP accepts JPEG only. Preserve existing JPEGs that fit; convert PNG and
-	// larger JPEGs to bounded baseline JPEGs for the native Apple TV path.
-	if format != "jpeg" || len(data) > artworkMaxBytes || !bytes.HasSuffix(data, []byte{0xff, 0xd9}) {
-		var encoded bytes.Buffer
-		if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 85}); err != nil {
-			return nil, errors.New("封面转换失败")
-		}
-		data = encoded.Bytes()
+	// Normalize every input to a bounded baseline JPEG, including progressive
+	// JPEGs. Composite transparency on white before encoding, matching MA's
+	// thumbnail preparation instead of turning transparent PNG regions black.
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, flattenArtwork(img), &jpeg.Options{Quality: 85}); err != nil {
+		return nil, errors.New("封面转换失败")
 	}
+	data = encoded.Bytes()
 	if len(data) > artworkMaxBytes {
 		return nil, errors.New("封面超过发送大小限制")
 	}
 	return data, nil
+}
+
+func flattenArtwork(src image.Image) *image.RGBA {
+	bounds := src.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	width, height := w, h
+	if w > artworkSize || h > artworkSize {
+		if w >= h {
+			width, height = artworkSize, max(1, h*artworkSize/w)
+		} else {
+			width, height = max(1, w*artworkSize/h), artworkSize
+		}
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	// Box filtering visits each source pixel once and keeps memory bounded.
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			var red, green, blue, count uint64
+			for sy := y * h / height; sy < (y+1)*h/height; sy++ {
+				for sx := x * w / width; sx < (x+1)*w/width; sx++ {
+					r, g, b, a := src.At(bounds.Min.X+sx, bounds.Min.Y+sy).RGBA()
+					red += uint64(r + 0xffff - a)
+					green += uint64(g + 0xffff - a)
+					blue += uint64(b + 0xffff - a)
+					count++
+				}
+			}
+			dst.SetRGBA(x, y, color.RGBA{R: uint8((red / count) >> 8), G: uint8((green / count) >> 8), B: uint8((blue / count) >> 8), A: 255})
+		}
+	}
+	return dst
 }

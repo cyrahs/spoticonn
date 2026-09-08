@@ -264,6 +264,14 @@ func TestAirPlayEngineProcess(t *testing.T) {
 		if commandLog != nil {
 			fmt.Fprintln(commandLog, sc.Text())
 		}
+		if path, ok := strings.CutPrefix(sc.Text(), "ARTWORK="); ok && path != "" && commandLog != nil {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				fmt.Fprintln(commandLog, "ARTWORK_LOAD_FAILED")
+			} else {
+				fmt.Fprintf(commandLog, "ARTWORK_LOADED item=%s sha256=%x\n", item, sha256.Sum256(data))
+			}
+		}
 		switch sc.Text() {
 		case "ACTION=SENDMETA":
 			if event := os.Getenv("SPOTICONN_TEST_AIRPLAY_REMOTE"); event != "" {
